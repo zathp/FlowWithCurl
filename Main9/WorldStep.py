@@ -6,7 +6,17 @@ class WorldStep:
 
 
 
-    def __init__(self, base_eddy=0.7, damping=0.02, dispersion=-0.5, particle_mass=1.0, particle_c=1.0, nx=50, ny=50, nz=50, lx=4.0, ly=4.0, lz=4.0, k1_size=3, k2_size=2, seed=0):
+    def __init__(
+            self,
+            base_eddy=0.7,
+            damping=0.02,
+            dispersion=-0.5,
+            particle_mass=1.0,
+            particle_c=1.0,
+            nx=50, ny=50, nz=50,
+            lx=4.0, ly=4.0, lz=4.0,
+            k1_size=3, k2_size=2, k3_size=3, k4_size=2,
+            seed=0):
         
         self.NX = nx
         self.NY = ny
@@ -18,7 +28,6 @@ class WorldStep:
 
         self.dispersion = dispersion
         self.particle_mass = particle_mass
-        self.particle_c = particle_c
 
         self.k1_size = k1_size
         self.k2_size = k2_size
@@ -34,7 +43,7 @@ class WorldStep:
         self.flowfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
 
-        self.densityfield = self.init_densityfield()
+        self.init_densityfield()
         pass
 
     def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0)):
@@ -68,13 +77,6 @@ class WorldStep:
         # Properly initialize densityfield with random values in [-1,1]
         self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
         return self.densityfield
-
-    def calculate_gradientfield(self):
-        gradientfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        gradientfield[..., 0] = cp.gradient(self.densityfield, axis=2)  # d/dx
-        gradientfield[..., 1] = cp.gradient(self.densityfield, axis=1)  # d/dy
-        gradientfield[..., 2] = cp.gradient(self.densityfield, axis=0)  # d/dz
-        return gradientfield
     
     def calculate_gradientfield_kernal(self, field):
         gradientfield = cp.zeros_like(field)
@@ -89,29 +91,23 @@ class WorldStep:
                     gradientfield[..., 1] += weight * shifted * (j+0.5)
                     gradientfield[..., 2] += weight * shifted * (k+0.5)
         return gradientfield
-
-    def calculate_curlfield(self):
-        curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-
-        dFz_dy = cp.gradient(self.flowfield[..., 2], axis=1)
-        dFy_dz = cp.gradient(self.flowfield[..., 1], axis=0)
-        curlfield[..., 0] = dFz_dy - dFy_dz
-
-        dFx_dz = cp.gradient(self.flowfield[..., 0], axis=0)
-        dFz_dx = cp.gradient(self.flowfield[..., 2], axis=2)
-        curlfield[..., 1] = dFx_dz - dFz_dx
-
-        dFy_dx = cp.gradient(self.flowfield[..., 1], axis=2)
-        dFx_dy = cp.gradient(self.flowfield[..., 0], axis=1)
-        curlfield[..., 2] = dFy_dx - dFx_dy
-
-        return curlfield
+    
+    def calculate_divergence_from_flow_kernal(self, field):
+        divergencefield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+        for i in range(-self.k2_size, self.k2_size):
+            for j in range(-self.k2_size, self.k2_size):
+                for k in range(-self.k2_size, self.k2_size):
+                    r = math.sqrt((i - 0.5)*(i - 0.5) + (j - 0.5)*(j - 0.5) + (k - 0.5)*(k - 0.5))
+                    weight = r/(1 + r*r) / self.ahat2_weight
+                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
+                    divergencefield += weight * (shifted[...,0] * (i - 0.5) + shifted[...,1] * (j - 0.5) + shifted[...,2] * (k - 0.5))
+        return divergencefield
     
     def calculate_curlfield_kernal(self, field):
         curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        for i in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
-            for j in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
-                for k in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
+        for i in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
+            for j in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
+                for k in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
                     r = math.sqrt(i*i + j*j + k*k)
                     weight = math.exp(self.dispersion * r) / self.ahat1_weight
                     shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
@@ -119,6 +115,7 @@ class WorldStep:
                     r_vec = cp.array([i, j, k], dtype=cp.float32)
                     curlfield += weight * cp.cross(r_vec, shifted)
         return curlfield
+    
 
     def diffuse_field_kernal(self, field):
         diffused_field = cp.zeros_like(field)

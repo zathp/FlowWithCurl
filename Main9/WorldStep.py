@@ -102,7 +102,9 @@ class WorldStep:
 
         return curlfield
     
-    def calculate_curlfield_kernal(self):
+    def calculate_curlfield_kernal(self, field):
+        curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+
         pass
 
     def diffuse_field_kernal(self, field):
@@ -134,6 +136,7 @@ class WorldStep:
 
     def step_flowfield(self, gradientfield, dt=0.1):
         self.flowfield += gradientfield * dt
+        curlfactorField = self.calculate_curlfield()
         pass
 
     def step_curlfield(self, dt=0.1):
@@ -143,6 +146,7 @@ class WorldStep:
         particleMotion = self.particles - self.particles_prev
 
         impulse = self.compute_gradient_contributions(self.particles, self.calculate_gradientfield(), self.curlfield)
+        print(impulse)
 
         particleMotion += impulse * (dt / self.particle_mass)
 
@@ -160,7 +164,7 @@ class WorldStep:
         scale = cp.minimum(1.0, max_len / (mag + 1e-9))
         return points * scale
 
-    def compute_gradient_contributions(self, Points, GradientField, CurlField):
+    def compute_gradient_contributions(self, Points, GradientField):
 
         # Max and Min values for wrapping
         Max_X = self.LX * (self.NX + 1) / 2
@@ -252,6 +256,9 @@ class WorldStep:
 
             
         return impulseContributions
+    
+    def compute_curl_contributions(self, Points, Points_Prev, CurlField):
+        pass
 
 
     # -------------------------

@@ -29,9 +29,12 @@ class WorldStep:
         self.particles = self.generate_initial_particles(nx, ny, nz,
             origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
         self.particles_prev = cp.copy(self.particles)
-        self.curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        self.flowfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        self.densityfield = cp.empty((self.NZ, self.NY, self.NX), dtype=cp.float32)
+        # initialize fields to zeros to avoid uninitialized memory
+        self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.flowfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+
+        self.densityfield = self.init_densityfield()
         pass
 
     def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0)):
@@ -62,8 +65,9 @@ class WorldStep:
                     self.ahat2_weight += r/(1 + r*r)
 
     def init_densityfield(self):
-        self.densityfield.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
-        pass
+        # Properly initialize densityfield with random values in [-1,1]
+        self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
+        return self.densityfield
 
     def calculate_gradientfield(self):
         gradientfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
@@ -72,14 +76,15 @@ class WorldStep:
         gradientfield[..., 2] = cp.gradient(self.densityfield, axis=0)  # d/dz
         return gradientfield
     
-    def calculate_gradientfield_kernal(self):
-        gradientfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+    def calculate_gradientfield_kernal(self, field):
+        gradientfield = cp.zeros_like(field)
+        gradientfield = cp.stack((gradientfield, gradientfield, gradientfield), axis=-1)
         for i in range(-self.k2_size, self.k2_size):
             for j in range(-self.k2_size, self.k2_size):
                 for k in range(-self.k2_size, self.k2_size):
                     r = math.sqrt((i+0.5)*(i+0.5) + (j+0.5)*(j+0.5) + (k+0.5)*(k+0.5))
                     weight = r/(1 + r*r) / self.ahat2_weight
-                    shifted = cp.roll(self.densityfield, shift=(i, j, k), axis=(0, 1, 2))
+                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
                     gradientfield[..., 0] += weight * shifted * (i+0.5)
                     gradientfield[..., 1] += weight * shifted * (j+0.5)
                     gradientfield[..., 2] += weight * shifted * (k+0.5)
@@ -104,8 +109,16 @@ class WorldStep:
     
     def calculate_curlfield_kernal(self, field):
         curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-
-        pass
+        for i in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
+            for j in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
+                for k in range(-(self.k1_size-1)/2, (self.k1_size-1)/2):
+                    r = math.sqrt(i*i + j*j + k*k)
+                    weight = math.exp(self.dispersion * r) / self.ahat1_weight
+                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
+                    # Compute contributions to curl here
+                    r_vec = cp.array([i, j, k], dtype=cp.float32)
+                    curlfield += weight * cp.cross(r_vec, shifted)
+        return curlfield
 
     def diffuse_field_kernal(self, field):
         diffused_field = cp.zeros_like(field)
@@ -118,6 +131,8 @@ class WorldStep:
                     diffused_field += weight * shifted
         return diffused_field
 
+    # -------------------------
+    # Simulation step functions
 
     def step(self, dt=0.1):
         self.step_densityfield(dt)
@@ -132,11 +147,13 @@ class WorldStep:
         # diffusion
         density_diffused = self.diffuse_field_kernal(self.densityfield)
         self.densityfield = (1 - diffusion_rate) * self.densityfield + diffusion_rate * density_diffused
+
+        self.densityfield += cp.sum(self.calculate_gradientfield_kernal(self.flowfield), (3,4)) * dt
         pass
 
     def step_flowfield(self, gradientfield, dt=0.1):
-        self.flowfield += gradientfield * dt
-        curlfactorField = self.calculate_curlfield()
+        self.flowfield += self.calculate_gradientfield_kernal(self.densityfield) * dt
+        eddyflowfield += self.calculate_curlfield_kernal(self.curlfield)
         pass
 
     def step_curlfield(self, dt=0.1):
@@ -285,5 +302,48 @@ class WorldStep:
         verts[..., 5] = normA[..., 2] * 0.5 + 0.5
 
         return verts
+
+    # -------------------------
+    # Diagnostics / helpers
+    # -------------------------
+    def get_field_stats(self, field: str):
+        """Return simple stats (min,max,mean) for a named field.
+
+        field: 'density' | 'flow' | 'curl'
+        For 'flow' and 'curl' we report statistics on magnitude.
+        """
+        if field == "density":
+            arr = self.densityfield
+            vmin = float(cp.min(arr))
+            vmax = float(cp.max(arr))
+            vmean = float(cp.mean(arr))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        elif field == "flow":
+            mag = cp.linalg.norm(self.flowfield, axis=-1)
+            vmin = float(cp.min(mag))
+            vmax = float(cp.max(mag))
+            vmean = float(cp.mean(mag))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        elif field == "curl":
+            mag = cp.linalg.norm(self.curlfield, axis=-1)
+            vmin = float(cp.min(mag))
+            vmax = float(cp.max(mag))
+            vmean = float(cp.mean(mag))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        else:
+            raise ValueError("Unknown field: %s" % field)
+
+    def print_field_stats(self):
+        """Print diagnostics for density, flow, and curl to console (CuPy -> host floats)."""
+        try:
+            d = self.get_field_stats("density")
+            f = self.get_field_stats("flow")
+            c = self.get_field_stats("curl")
+            print("Field stats:")
+            print(f"  density: min={d['min']:.6g} max={d['max']:.6g} mean={d['mean']:.6g}")
+            print(f"  flow mag: min={f['min']:.6g} max={f['max']:.6g} mean={f['mean']:.6g}")
+            print(f"  curl mag: min={c['min']:.6g} max={c['max']:.6g} mean={c['mean']:.6g}")
+        except Exception as e:
+            print("Error computing field stats:", e)
 
 

@@ -74,30 +74,82 @@ class WorldStep:
         return field.reshape((nx * ny * nz, 3))
 
     def init_kernels(self):
+        # Precompute diffusion kernel weights (k1_size)
+        self.diffuse_weights = []
+        self.diffuse_shifts = []
         self.ahat1_weight = 0.0
         for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
             for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
                 for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
                     r = math.sqrt(i*i + j*j + k*k)
-                    self.ahat1_weight += math.exp(self.dispersion * r)
+                    weight = math.exp(self.dispersion * r)
+                    self.ahat1_weight += weight
+                    self.diffuse_weights.append(weight)
+                    self.diffuse_shifts.append((i, j, k))
+        # Normalize weights
+        self.diffuse_weights = [w / self.ahat1_weight for w in self.diffuse_weights]
+        
+        # Precompute curl kernel data (reuses k1_size, same as diffuse)
+        self.curl_weights = []
+        self.curl_shifts = []
+        self.curl_rvecs = []
+        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+                    r = math.sqrt(i*i + j*j + k*k)
+                    weight = math.exp(self.dispersion * r) / self.ahat1_weight
+                    self.curl_weights.append(weight)
+                    self.curl_shifts.append((i, j, k))
+                    self.curl_rvecs.append(cp.array([i, j, k], dtype=cp.float32))
 
+        # Precompute gradient kernel data (k2_size)
+        self.gradient_weights = []
+        self.gradient_shifts = []
+        self.gradient_offsets = []
         self.ahat2_weight = 0.0
         for i in range(-self.k2_size, self.k2_size):
             for j in range(-self.k2_size, self.k2_size):
                 for k in range(-self.k2_size, self.k2_size):
                     r = math.sqrt((i+0.5)*(i+0.5) + (j+0.5)*(j+0.5) + (k+0.5)*(k+0.5))
-                    self.ahat2_weight += r/(1 + r*r)
+                    weight = r/(1 + r*r)
+                    self.ahat2_weight += weight
+                    self.gradient_weights.append(weight)
+                    self.gradient_shifts.append((i, j, k))
+                    self.gradient_offsets.append((i+0.5, j+0.5, k+0.5))
+        # Normalize gradient weights
+        self.gradient_weights = [w / self.ahat2_weight for w in self.gradient_weights]
+        
+        # Precompute divergence kernel data (k2_size with different range)
+        self.divergence_weights = []
+        self.divergence_shifts = []
+        self.divergence_offsets = []
+        for i in range(-self.k2_size + 1, self.k2_size + 1):
+            for j in range(-self.k2_size + 1, self.k2_size + 1):
+                for k in range(-self.k2_size + 1, self.k2_size + 1):
+                    r = math.sqrt((i - 0.5)*(i - 0.5) + (j - 0.5)*(j - 0.5) + (k - 0.5)*(k - 0.5))
+                    weight = r/(1 + r*r) / self.ahat2_weight
+                    self.divergence_weights.append(weight)
+                    self.divergence_shifts.append((i, j, k))
+                    self.divergence_offsets.append((i - 0.5, j - 0.5, k - 0.5))
 
         self.ahat3_weight = 0.0
 
         self.ahat4_weight = 0.0
 
+        # Precompute fieldmean kernel weights (k5_size)
+        self.mean_weights = []
+        self.mean_shifts = []
         self.ahat5_weight = 0.0
         for i in range(-self.k5_size, self.k5_size + 1):
             for j in range(-self.k5_size, self.k5_size + 1):
                 for k in range(-self.k5_size, self.k5_size + 1):
                     r = math.sqrt(i*i + j*j + k*k)
-                    self.ahat5_weight += 1/(1 + r*r)
+                    weight = 1/(1 + r*r)
+                    self.ahat5_weight += weight
+                    self.mean_weights.append(weight)
+                    self.mean_shifts.append((i, j, k))
+        # Normalize weights
+        self.mean_weights = [w / self.ahat5_weight for w in self.mean_weights]
 
     def init_densityfield(self):
         # Properly initialize densityfield with random values in [-1,1]
@@ -129,68 +181,46 @@ class WorldStep:
     def calculate_gradientfield_kernal(self, field):
         gradientfield = cp.zeros_like(field)
         gradientfield = cp.stack((gradientfield, gradientfield, gradientfield), axis=-1)
-        for i in range(-self.k2_size, self.k2_size):
-            for j in range(-self.k2_size, self.k2_size):
-                for k in range(-self.k2_size, self.k2_size):
-                    r = math.sqrt((i+0.5)*(i+0.5) + (j+0.5)*(j+0.5) + (k+0.5)*(k+0.5))
-                    weight = r/(1 + r*r) / self.ahat2_weight
-                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
-                    gradientfield[..., 0] += weight * shifted * (i+0.5)
-                    gradientfield[..., 1] += weight * shifted * (j+0.5)
-                    gradientfield[..., 2] += weight * shifted * (k+0.5)
+        for weight, shift, offset in zip(self.gradient_weights, self.gradient_shifts, self.gradient_offsets):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            gradientfield[..., 0] += weight * shifted * offset[0]
+            gradientfield[..., 1] += weight * shifted * offset[1]
+            gradientfield[..., 2] += weight * shifted * offset[2]
         return gradientfield
     
     def calculate_divergence_from_flow_kernal(self, field):
         divergencefield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
-        for i in range(-self.k2_size + 1, self.k2_size + 1):
-            for j in range(-self.k2_size + 1, self.k2_size + 1):
-                for k in range(-self.k2_size + 1, self.k2_size + 1):
-                    r = math.sqrt((i - 0.5)*(i - 0.5) + (j - 0.5)*(j - 0.5) + (k - 0.5)*(k - 0.5))
-                    weight = r/(1 + r*r) / self.ahat2_weight
-                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
-                    divergencefield += weight * (shifted[...,0] * (i - 0.5) + shifted[...,1] * (j - 0.5) + shifted[...,2] * (k - 0.5))
+        for weight, shift, offset in zip(self.divergence_weights, self.divergence_shifts, self.divergence_offsets):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            divergencefield += weight * (shifted[...,0] * offset[0] + shifted[...,1] * offset[1] + shifted[...,2] * offset[2])
         return divergencefield
     
     def calculate_curlfield_kernal(self, field):
-        curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
-            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
-                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
-                    r = math.sqrt(i*i + j*j + k*k)
-                    weight = math.exp(self.dispersion * r) / self.ahat1_weight
-                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
-                    # Compute contributions to curl here
-                    r_vec = cp.array([i, j, k], dtype=cp.float32)
-                    curlfield += weight * cp.cross(r_vec, shifted)
+        curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        for weight, shift, r_vec in zip(self.curl_weights, self.curl_shifts, self.curl_rvecs):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            curlfield += weight * cp.cross(r_vec, shifted)
         return curlfield
     
 
     def diffuse_field_kernal(self, field):
         diffused_field = cp.zeros_like(field)
-        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
-            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
-                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
-                    r = math.sqrt(i*i + j*j + k*k)
-                    weight = math.exp(self.dispersion * r) / self.ahat1_weight
-                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
-                    diffused_field += weight * shifted
+        for weight, shift in zip(self.diffuse_weights, self.diffuse_shifts):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            diffused_field += weight * shifted
         return diffused_field
     
     def fieldmean(self, field):
         mean_fields = cp.zeros_like(field)
-        for i in range(-self.k5_size, self.k5_size + 1):
-            for j in range(-self.k5_size, self.k5_size + 1):
-                for k in range(-self.k5_size, self.k5_size + 1):
-                    r = math.sqrt(i*i + j*j + k*k)
-                    weight = 1/(1 + r*r) / self.ahat5_weight
-                    shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
-                    mean_fields += weight * shifted
+        for weight, shift in zip(self.mean_weights, self.mean_shifts):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            mean_fields += weight * shifted
         return mean_fields
 
     # -------------------------
     # Simulation step functions
 
-    def step(self, dt=0.1, print_timings=False):
+    def step(self, dt=0.1, print_timings=True):
         timings = {}
         
         t0 = time.perf_counter()
@@ -426,61 +456,53 @@ class WorldStep:
 
         impulseContributions = cp.zeros_like(Points)
 
-        for i in range(8):
-            if(i==0):
-                SelPoints = cp.stack((ceil_X, ceil_Y, ceil_Z), axis=-1)
-                SelGradients = GradientField[ceil_X, ceil_Y, ceil_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                #print(SelGradients.shape)
-                #print(SelPoints.shape)
-                #print(GradientField.shape)
-                #print(R_factor.shape)
-                #print(impulseContributions.shape)
-                #print(cp.stack((R_factor, R_factor, R_factor), 1).shape)
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==1):
-                SelPoints = cp.stack((ceil_X, ceil_Y, floor_Z), axis=-1)
-                SelGradients = GradientField[ceil_X, ceil_Y, floor_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==2):
-                SelPoints = cp.stack((ceil_X, floor_Y, ceil_Z), axis=-1)
-                SelGradients = GradientField[ceil_X, floor_Y, ceil_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==3):
-                SelPoints = cp.stack((ceil_X, floor_Y, floor_Z), axis=-1)
-                SelGradients = GradientField[ceil_X, floor_Y, floor_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==4):
-                SelPoints = cp.stack((floor_X, ceil_Y, ceil_Z), axis=-1)
-                SelGradients = GradientField[floor_X, ceil_Y, ceil_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==5):
-                SelPoints = cp.stack((floor_X, ceil_Y, floor_Z), axis=-1)
-                SelGradients = GradientField[floor_X, ceil_Y, floor_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==6):
-                SelPoints = cp.stack((floor_X, floor_Y, ceil_Z), axis=-1)
-                SelGradients = GradientField[floor_X, floor_Y, ceil_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
-            elif(i==7):
-                SelPoints = cp.stack((floor_X, floor_Y, floor_Z), axis=-1)
-                SelGradients = GradientField[floor_X, floor_Y, floor_Z]
-                R_vec = Points - SelPoints
-                R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
-                impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        SelPoints = cp.stack((ceil_X, ceil_Y, ceil_Z), axis=-1)
+        SelGradients = GradientField[ceil_X, ceil_Y, ceil_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((ceil_X, ceil_Y, floor_Z), axis=-1)
+        SelGradients = GradientField[ceil_X, ceil_Y, floor_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((ceil_X, floor_Y, ceil_Z), axis=-1)
+        SelGradients = GradientField[ceil_X, floor_Y, ceil_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((ceil_X, floor_Y, floor_Z), axis=-1)
+        SelGradients = GradientField[ceil_X, floor_Y, floor_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((floor_X, ceil_Y, ceil_Z), axis=-1)
+        SelGradients = GradientField[floor_X, ceil_Y, ceil_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((floor_X, ceil_Y, floor_Z), axis=-1)
+        SelGradients = GradientField[floor_X, ceil_Y, floor_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((floor_X, floor_Y, ceil_Z), axis=-1)
+        SelGradients = GradientField[floor_X, floor_Y, ceil_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack((floor_X, floor_Y, floor_Z), axis=-1)
+        SelGradients = GradientField[floor_X, floor_Y, floor_Z]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
 
             
         return impulseContributions

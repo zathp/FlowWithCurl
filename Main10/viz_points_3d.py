@@ -11,12 +11,14 @@ POINTS_VERT = """
 #version 330 core
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 color_in;
+layout(location = 2) in float size_in;
 uniform mat4 mvp;
+uniform float min_size;
 out vec3 color;
 void main() {
     gl_Position = mvp * vec4(position, 1.0);
     color = color_in;
-    gl_PointSize = 6.0;
+    gl_PointSize = max(size_in, min_size);
 }
 """
 
@@ -62,7 +64,7 @@ def run_viewer(sim, width=1000, height=800):
     # allocate initial empty buffer (will update each frame)
     max_points = sim.NX * sim.NY * sim.NZ
     float_size = 4
-    vertex_stride = 6 * float_size
+    vertex_stride = 7 * float_size  # position(3) + color(3) + size(1)
     gl.glBufferData(gl.GL_ARRAY_BUFFER, max_points * vertex_stride, None, gl.GL_DYNAMIC_DRAW)
 
     # position attribute
@@ -71,6 +73,9 @@ def run_viewer(sim, width=1000, height=800):
     # color attribute
     gl.glEnableVertexAttribArray(1)
     gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, gl.ctypes.c_void_p(12))
+    # size attribute
+    gl.glEnableVertexAttribArray(2)
+    gl.glVertexAttribPointer(2, 1, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, gl.ctypes.c_void_p(24))
 
     # Bounding box line setup (12 edges * 2 vertices)
     box_vao = gl.glGenVertexArrays(1)
@@ -300,7 +305,7 @@ def run_viewer(sim, width=1000, height=800):
                 for ix in range(0, nx, stride):
                     idxs.append((iz, iy, ix))
 
-        out = np.empty((len(idxs) * 2, 6), dtype=np.float32)
+        out = np.empty((len(idxs) * 2, 7), dtype=np.float32)
         vi = 0
         # scale factor relative to cell size
         cell_scale = max(sim.LX, sim.LY, sim.LZ)
@@ -316,9 +321,11 @@ def run_viewer(sim, width=1000, height=800):
             color = (np.abs(dirv) * 0.5 + 0.25).astype(np.float32)
             out[vi, 0:3] = [cx, cy, cz]
             out[vi, 3:6] = color
+            out[vi, 6] = 1.0  # size placeholder
             vi += 1
             out[vi, 0:3] = end
             out[vi, 3:6] = color
+            out[vi, 6] = 1.0
             vi += 1
         return out
 
@@ -359,6 +366,7 @@ def run_viewer(sim, width=1000, height=800):
     view = pyrr.matrix44.create_look_at(eye, center, up, dtype=np.float32)
 
     mvp_loc = gl.glGetUniformLocation(shader, "mvp")
+    min_size_loc = gl.glGetUniformLocation(shader, "min_size")
 
     # Precompute bounding box edges (use fixed coordinates)
     corners = np.array([
@@ -424,6 +432,7 @@ def run_viewer(sim, width=1000, height=800):
         mvp_upload = mvp.T.astype(np.float32)
         gl.glUseProgram(shader)
         gl.glUniformMatrix4fv(mvp_loc, 1, gl.GL_FALSE, mvp_upload)
+        gl.glUniform1f(min_size_loc, 3.0)
 
         # draw depending on mode
         gl.glBindVertexArray(vao)

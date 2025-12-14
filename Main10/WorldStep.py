@@ -54,6 +54,7 @@ class WorldStep:
         self.flowfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.flowfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+        self.densityfield2 = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
 
         self.init_densityfield()
         self.init_flowfield(seed=seed, magnitude=2.0)
@@ -100,6 +101,8 @@ class WorldStep:
     def init_densityfield(self):
         # Properly initialize densityfield with random values in [-1,1]
         self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
+        # Initialize densityfield2 the same way
+        self.densityfield2 = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
         return self.densityfield
 
     def init_flowfield(self, seed=None, magnitude=None):
@@ -188,10 +191,13 @@ class WorldStep:
 
     def step(self, dt=0.1):
         self.step_densityfield(dt)
+        self.step_densityfield2(dt)
         gradientfield = self.calculate_gradientfield_kernal(self.densityfield)
         self.step_flowfield(dt)
         self.step_curlfield(dt)
         self.step_particles(dt)
+        self.inject_particles_to_density1(strength_pos=0.3, strength_neg=0.3)  # particles influence densityfield
+        self.inject_particles_to_density2(strength=0.5)  # particles add density locally
         pass
     
     def step_densityfield(self, dt=0.1, diffusion_rate=0.1, curl_divergence_strength=0.0):
@@ -216,6 +222,21 @@ class WorldStep:
         
         # Clamp to reasonable range
         self.densityfield = cp.clip(self.densityfield, -1.0, 1.0)
+
+    def step_densityfield2(self, dt=0.1, diffusion_rate=0.1, decay_rate=0.998):
+        """Diffuse second density field with exponential decay (no flow, no curl, pure diffusion).
+        
+        decay_rate: multiplicative decay per frame (0.98 = 2% loss per step)
+        """
+        # Diffuse density
+        density_diffused = self.diffuse_field_kernal(self.densityfield2)
+        self.densityfield2 = (1 - diffusion_rate) * self.densityfield2 + diffusion_rate * density_diffused
+        
+        # Apply exponential decay
+        self.densityfield2 *= decay_rate
+        
+        # Clamp to reasonable range
+        self.densityfield2 = cp.clip(self.densityfield2, -1.0, 1.0)
 
     def step_flowfield(self, dt=0.1, flow_diffusion_rate=0.05):
         """Update flow field using density gradients and eddy effects."""
@@ -248,8 +269,11 @@ class WorldStep:
         curl_diffused = self.diffuse_field_kernal(self.curlfield)
         self.curlfield = (1 - curl_diffusion_rate) * self.curlfield + curl_diffusion_rate * curl_diffused
 
-    def step_particles(self, dt=0.1):
-        """Advect both particle sets using flow field."""
+    def step_particles(self, dt=0.1, density2_follow_strength=0.3):
+        """Advect both particle sets using flow field and densityfield2 gradient.
+        
+        density2_follow_strength: how strongly particles follow densityfield2 gradient (0 to disable)
+        """
         # Track previous positions for both sets
         self.particles_prev = cp.copy(self.particles)
         self.particles2_prev = cp.copy(self.particles2)
@@ -257,6 +281,14 @@ class WorldStep:
         # Get impulse from gradient field (flow field influences particle motion)
         flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
         flow_contrib2 = self.compute_gradient_contributions(self.particles2, self.flowfield)
+        
+        # Get gradient contribution from densityfield2 (particles follow density uphill)
+        if density2_follow_strength > 0:
+            density2_grad = self.calculate_gradientfield_kernal(self.densityfield2)
+            density2_contrib = self.compute_gradient_contributions(self.particles, density2_grad)
+            density2_contrib2 = self.compute_gradient_contributions(self.particles2, density2_grad)
+            flow_contrib += density2_contrib * density2_follow_strength
+            flow_contrib2 += density2_contrib2 * density2_follow_strength
         
         # Update velocity and position for both sets
         self.particles += flow_contrib * dt
@@ -276,6 +308,52 @@ class WorldStep:
         self.particles2[..., 0] = cp.mod(self.particles2[..., 0] + half_lx, self.LX * self.NX) - half_lx
         self.particles2[..., 1] = cp.mod(self.particles2[..., 1] + half_ly, self.LY * self.NY) - half_ly
         self.particles2[..., 2] = cp.mod(self.particles2[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
+
+    def inject_particles_to_density2(self, strength=0.5):
+        """Inject particle density into densityfield2 at particle locations.
+        
+        strength: how much density each particle contributes (0 to 1 range)
+        """
+        # Map particle positions to grid indices
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+        
+        # Convert positions to normalized indices [0, N)
+        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        
+        # Add density contribution from particles
+        cp.add.at(self.densityfield2, (iz, iy, ix), strength)
+        
+        # Also inject particles2 (opposite set)
+        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        
+        cp.add.at(self.densityfield2, (iz2, iy2, ix2), strength)
+
+    def inject_particles_to_density1(self, strength_pos=0.3, strength_neg=0.3):
+        """Inject particles into densityfield with opposite signs by type.
+
+        particles  (set1) add +strength_pos; particles2 add -strength_neg.
+        """
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+
+        # set1 indices
+        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        cp.add.at(self.densityfield, (iz, iy, ix), strength_pos)
+
+        # set2 indices
+        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        cp.add.at(self.densityfield, (iz2, iy2, ix2), -strength_neg)
 
 
     def clamp_magnitude_gpu(points, max_len):
@@ -383,15 +461,15 @@ class WorldStep:
     # -------------------------
     # Vertex generation for rendering
     # -------------------------
-    def build_point_vertices(self):
+    def build_point_vertices(self, min_size=3.0, max_size=18.0):
         """
-        Returns a CuPy array of shape (2*NZ*NY*NX, 6):
-          [x, y, z, r, g, b]
+        Returns a CuPy array of shape (2*NZ*NY*NX, 7):
+          [x, y, z, r, g, b, size]
         for point cloud visualization with two particle sets.
         First 50% colored by velocity, second 50% colored cyan.
         """
         n_particles = self.NZ * self.NY * self.NX
-        verts = cp.empty((2 * n_particles, 6), dtype=cp.float32)
+        verts = cp.empty((2 * n_particles, 7), dtype=cp.float32)
 
         # First particle set: positions and velocity-based colors
         verts[0:n_particles, 0:3] = self.particles
@@ -401,12 +479,19 @@ class WorldStep:
         verts[0:n_particles, 3] = normA[..., 0] * 0.5 + 0.5
         verts[0:n_particles, 4] = normA[..., 1] * 0.5 + 0.5
         verts[0:n_particles, 5] = normA[..., 2] * 0.5 + 0.5
+        # size scaled by speed magnitude
+        speed = mag_A
+        speed_norm = speed / (cp.max(speed) + 1e-6)
+        size = min_size + (max_size - min_size) * speed_norm
+        verts[0:n_particles, 6] = size
 
         # Second particle set: positions and fixed cyan color
         verts[n_particles:2*n_particles, 0:3] = self.particles2
         verts[n_particles:2*n_particles, 3] = 0.2  # cyan: low red
         verts[n_particles:2*n_particles, 4] = 0.9  # cyan: high green
         verts[n_particles:2*n_particles, 5] = 0.9  # cyan: high blue
+        # give second set a slightly larger base size
+        verts[n_particles:2*n_particles, 6] = min_size * 1.2
 
         return verts
 

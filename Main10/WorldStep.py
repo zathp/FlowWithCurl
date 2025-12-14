@@ -17,8 +17,9 @@ class WorldStep:
             base_eddy=0.7,
             damping=0.02,
             dispersion=-0.5,
-            particle_mass=1.0,
-            particle_c=1.0,
+            particle_mass1=1.0,
+            particle_mass2=1.0,
+            particle_dispersion=1,
             nx=50, ny=50, nz=50,
             lx=4.0, ly=4.0, lz=4.0,
             k1_size=3, k2_size=2, k3_size=3, k4_size=2, k5_size=2,
@@ -35,7 +36,8 @@ class WorldStep:
         # base magnitude for flow vectors
         self.base_eddy = float(base_eddy)
         self.dispersion = dispersion
-        self.particle_mass = particle_mass
+        self.particle_mass1 = particle_mass1
+        self.particle_mass2 = particle_mass2
         self.damping = damping
 
         #initialize kernel average weights for normalization
@@ -48,11 +50,13 @@ class WorldStep:
         self.init_kernels()
         # initialize fields to zeros (curl/density); flow is seeded below
         self.particles = self.generate_initial_particles(nx, ny, nz,
-            origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
+            origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+            , step=particle_dispersion)
         self.particles_prev = cp.copy(self.particles)
         # second particle set (initialized with slight offset)
         self.particles2 = self.generate_initial_particles(nx, ny, nz,
-            origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
+            origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+            , step=particle_dispersion)
         self.particles2_prev = cp.copy(self.particles2)
         # initialize fields to zeros to avoid uninitialized memory
         self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
@@ -62,21 +66,24 @@ class WorldStep:
         self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
         self.densityfield2 = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
 
+        self.num_particles = self.particles.shape[0]
+
         self.init_densityfield()
         self.init_flowfield(seed=seed, magnitude=2.0)
         pass
 
-    def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0)):
+    def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0), step=1):
         ox, oy, oz = origin
         dx, dy, dz = spacing
 
-        x = ox + dx * cp.arange(nx)
-        y = oy + dy * cp.arange(ny)
-        z = oz + dz * cp.arange(nz)
+        x = ox + dx * cp.arange(nx, step=step)
+        y = oy + dy * cp.arange(ny, step=step)
+        z = oz + dz * cp.arange(nz, step=step)
 
         X, Y, Z = cp.meshgrid(x, y, z, indexing="ij")
         field = cp.stack((X, Y, Z), axis=-1)   # (nx, ny, nz, 3)
-        return field.reshape((nx * ny * nz, 3))
+        num_points = field.shape[0] * field.shape[1] * field.shape[2]
+        return field.reshape((num_points, 3)).astype(cp.float32)
 
     def init_kernels(self):
         # Precompute diffusion kernel weights (k1_size)
@@ -245,7 +252,7 @@ class WorldStep:
         timings['flowfield'] = time.perf_counter() - t0
         
         t0 = time.perf_counter()
-        self.step_curlfield(dt)
+        self.step_curlfield(dt, print_timings=print_timings)
         timings['curlfield'] = time.perf_counter() - t0
         
         t0 = time.perf_counter()
@@ -321,21 +328,57 @@ class WorldStep:
         # Damping
         self.flowfield *= (1.0 - self.damping)
 
-    def step_curlfield(self, dt=0.1, curl_diffusion_rate=0.1):
+    def step_curlfield(self, dt=0.1, curl_diffusion_rate=0.1, print_timings=False):
         """Update curl field from flow field with diffusion."""
+        if print_timings:
+            timings = {}
+            t0 = time.perf_counter()
+        
         self.curlfield_prev = cp.copy(self.curlfield)
+        
+        if print_timings:
+            timings['copy'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
         # Compute curl of the current flow field
         self.curlfield = self.calculate_curlfield_kernal(self.flowfield)
         
+        if print_timings:
+            timings['calculate_curl'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
         #calculate diffusion rate based on weighted average of the local density field density
         density_avg = self.fieldmean(self.densityfield)
+        
+        if print_timings:
+            timings['fieldmean'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
         curl_diffusion_rate = curl_diffusion_rate * (2 / (1 + density_avg * density_avg) - 1) # diffusion rate lowers and becomes negative in high density areas
         curl_diffusion_rate = cp.stack((curl_diffusion_rate, curl_diffusion_rate, curl_diffusion_rate), axis=-1)
+        
+        if print_timings:
+            timings['diffusion_rate_calc'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
         # Apply diffusion to smooth out vorticity
         curl_diffused = self.diffuse_field_kernal(self.curlfield)
+        
+        if print_timings:
+            timings['diffuse'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
         self.curlfield = (1 - curl_diffusion_rate) * self.curlfield + curl_diffusion_rate * curl_diffused
+        
+        if print_timings:
+            timings['blend'] = time.perf_counter() - t0
+            # Print breakdown
+            total = sum(timings.values())
+            print(f"  Curlfield breakdown (total={total*1000:.2f}ms):")
+            for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+                print(f"    {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
 
-    def step_particles(self, dt=0.1, density2_follow_strength=0.3):
+    def step_particles(self, dt=0.1, density2_follow_strength=-0.5):
         """Advect both particle sets using flow field and densityfield2 gradient.
         
         density2_follow_strength: how strongly particles follow densityfield2 gradient (0 to disable)
@@ -346,7 +389,7 @@ class WorldStep:
         
         # Get impulse from gradient field (flow field influences particle motion)
         flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
-        flow_contrib2 = self.compute_gradient_contributions(self.particles2, self.flowfield)
+        flow_contrib2 = -self.compute_gradient_contributions(self.particles2, self.flowfield)
         
         # Get gradient contribution from densityfield2 (particles follow density uphill)
         if density2_follow_strength > 0:
@@ -357,8 +400,8 @@ class WorldStep:
             flow_contrib2 += density2_contrib2 * density2_follow_strength
         
         # Update velocity and position for both sets
-        self.particles += flow_contrib * dt
-        self.particles2 += flow_contrib2 * dt
+        self.particles += flow_contrib * (dt / self.particle_mass1)
+        self.particles2 += flow_contrib2 * (dt / self.particle_mass2)
         
         # Apply toroidal wrapping/boundary conditions
         # Domain bounds: [-L*NX/2, L*NX/2] in each dimension
@@ -400,7 +443,7 @@ class WorldStep:
         
         cp.add.at(self.densityfield2, (iz2, iy2, ix2), strength)
 
-    def inject_particles_to_density1(self, strength_pos=0.3, strength_neg=0.3):
+    def inject_particles_to_density1(self, strength_pos=10, strength_neg=10):
         """Inject particles into densityfield with opposite signs by type.
 
         particles  (set1) add +strength_pos; particles2 add -strength_neg.
@@ -521,13 +564,13 @@ class WorldStep:
     # -------------------------
     def build_point_vertices(self, min_size=3.0, max_size=18.0):
         """
-        Returns a CuPy array of shape (2*NZ*NY*NX, 7):
-          [x, y, z, r, g, b, size]
+        Returns a CuPy array of shape (2*num_particles, 8):
+          [x, y, z, r, g, b, size, alpha]
         for point cloud visualization with two particle sets.
         First 50% colored by velocity, second 50% colored cyan.
         """
-        n_particles = self.NZ * self.NY * self.NX
-        verts = cp.empty((2 * n_particles, 7), dtype=cp.float32)
+        n_particles = self.num_particles
+        verts = cp.empty((2 * n_particles, 8), dtype=cp.float32)
 
         # First particle set: positions and velocity-based colors
         verts[0:n_particles, 0:3] = self.particles
@@ -542,6 +585,7 @@ class WorldStep:
         speed_norm = speed / (cp.max(speed) + 1e-6)
         size = min_size + (max_size - min_size) * speed_norm
         verts[0:n_particles, 6] = size
+        verts[0:n_particles, 7] = 1.0  # opaque
 
         # Second particle set: positions and fixed cyan color
         verts[n_particles:2*n_particles, 0:3] = self.particles2
@@ -550,6 +594,7 @@ class WorldStep:
         verts[n_particles:2*n_particles, 5] = 0.9  # cyan: high blue
         # give second set a slightly larger base size
         verts[n_particles:2*n_particles, 6] = min_size * 1.2
+        verts[n_particles:2*n_particles, 7] = 1.0  # opaque
 
         return verts
 

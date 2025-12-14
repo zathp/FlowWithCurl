@@ -1,6 +1,6 @@
 # main.py
 from WorldStep import WorldStep
-from Vizualizer_haze_with_topdown import run_viewer
+from viz_main import run_viewer
 
 # k1 in grid kernel for diffusion and curl calculation
 # k2 in grid kernel for divergence and gradient calculation

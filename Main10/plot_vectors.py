@@ -106,7 +106,7 @@ if __name__ == '__main__':
     p.add_argument('--scale', type=float, default=1.0)
     args = p.parse_args()
 
-    if True:
+    if args.load_dump:
         # Load from temp dump file
         dump_path = os.path.join(tempfile.gettempdir(), 'flowstep_dump.npz')
         if not os.path.exists(dump_path):

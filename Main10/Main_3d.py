@@ -15,7 +15,7 @@ def main():
             seed=1,
             dispersion=0.1,
             particle_mass1=1,
-            particle_mass2=1,
+            particle_mass2=0.1,
             particle_dispersion=3,
             k1_size=3,
             k2_size=1,

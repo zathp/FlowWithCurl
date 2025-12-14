@@ -1,5 +1,6 @@
 import cupy as cp
 import math
+import time
 
 class WorldStep:
 
@@ -189,16 +190,46 @@ class WorldStep:
     # -------------------------
     # Simulation step functions
 
-    def step(self, dt=0.1):
+    def step(self, dt=0.1, print_timings=False):
+        timings = {}
+        
+        t0 = time.perf_counter()
         self.step_densityfield(dt)
+        timings['densityfield'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         self.step_densityfield2(dt)
+        timings['densityfield2'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         gradientfield = self.calculate_gradientfield_kernal(self.densityfield)
+        timings['gradient'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         self.step_flowfield(dt)
+        timings['flowfield'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         self.step_curlfield(dt)
+        timings['curlfield'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
         self.step_particles(dt)
-        self.inject_particles_to_density1(strength_pos=0.3, strength_neg=0.3)  # particles influence densityfield
-        self.inject_particles_to_density2(strength=0.5)  # particles add density locally
-        pass
+        timings['particles'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        self.inject_particles_to_density1(strength_pos=0.3, strength_neg=0.3)
+        timings['inject_density1'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        self.inject_particles_to_density2(strength=0.5)
+        timings['inject_density2'] = time.perf_counter() - t0
+        
+        if print_timings:
+            total = sum(timings.values())
+            print(f"Step timings (ms): total={total*1000:.2f}")
+            for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+                print(f"  {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
     
     def step_densityfield(self, dt=0.1, diffusion_rate=0.1, curl_divergence_strength=0.0):
         """Advect and diffuse density field.

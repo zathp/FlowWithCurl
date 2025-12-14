@@ -1,30 +1,34 @@
-"""Launcher for the top-down particle visualizer."""
+# main.py
 from WorldStep import WorldStep
-from Vizualizer_particles_topdown import run_viewer
+from viz_main import run_viewer
 
-# k1 in grid kernel for diffusion and curl calculation (must be odd)
+# k1 in grid kernel for diffusion and curl calculation
 # k2 in grid kernel for divergence and gradient calculation
 # k3 in grid kernel for density field diffusion
 # k4 in grid kernel for double gradient calculation
-# k5 for local mean calculation
 
 
 def main():
+    # Create simulation (you can tweak grid size here)
     sim = WorldStep(
-        nx=1000,
-        ny=1000,
-        nz=1,
+        nx=100,
+        ny=100,
+        nz=10,
         lx=1.0,
         ly=1.0,
         lz=1.0,
         seed=0,
         dispersion=0.1,
-        particle_mass=2.0,
-        k1_size=5,
+        particle_mass=20.0,
+        k1_size=9,
+        k2_size=4,
+        k3_size=5,
+        k4_size=3,
     )
 
+    # Launch viewer
     run_viewer(sim)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

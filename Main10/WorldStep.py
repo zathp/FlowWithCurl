@@ -44,6 +44,10 @@ class WorldStep:
         self.particles = self.generate_initial_particles(nx, ny, nz,
             origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
         self.particles_prev = cp.copy(self.particles)
+        # second particle set (initialized with slight offset)
+        self.particles2 = self.generate_initial_particles(nx, ny, nz,
+            origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
+        self.particles2_prev = cp.copy(self.particles2)
         # initialize fields to zeros to avoid uninitialized memory
         self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.curlfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
@@ -190,8 +194,11 @@ class WorldStep:
         self.step_particles(dt)
         pass
     
-    def step_densityfield(self, dt=0.1, diffusion_rate=0.1):
-        """Advect and diffuse density field."""
+    def step_densityfield(self, dt=0.1, diffusion_rate=0.1, curl_divergence_strength=0.0):
+        """Advect and diffuse density field.
+        
+        curl_divergence_strength: how strongly curl magnitude drives density divergence (0 to disable).
+        """
         # Diffuse density
         density_diffused = self.diffuse_field_kernal(self.densityfield)
         self.densityfield = (1 - diffusion_rate) * self.densityfield + diffusion_rate * density_diffused
@@ -199,10 +206,18 @@ class WorldStep:
         # Advect density using flow field divergence
         self.densityfield += self.calculate_divergence_from_flow_kernal(self.flowfield) * dt
         
+        # Add divergence based on curl magnitude: high vorticity pushes density outward
+        if curl_divergence_strength > 0:
+            curl_mag = cp.linalg.norm(self.curlfield, axis=-1)  # shape (NZ, NY, NX)
+            # normalize curl magnitude to [0, 1] range for stable effect
+            curl_mag_normalized = curl_mag / (cp.max(curl_mag) + 1e-9)
+            # divergence contribution: positive curl magnitude = outward spreading
+            self.densityfield += curl_mag_normalized * curl_divergence_strength * dt
+        
         # Clamp to reasonable range
         self.densityfield = cp.clip(self.densityfield, -1.0, 1.0)
 
-    def step_flowfield(self, dt=0.1):
+    def step_flowfield(self, dt=0.1, flow_diffusion_rate=0.05):
         """Update flow field using density gradients and eddy effects."""
         # Pressure gradient from density
         self.flowfield += self.calculate_gradientfield_kernal(self.densityfield) * dt
@@ -211,6 +226,10 @@ class WorldStep:
         curl_change = self.curlfield - self.curlfield_prev
         eddyflowfield = self.calculate_curlfield_kernal(curl_change)
         self.flowfield += eddyflowfield * dt * 0.5  # Scale down eddy effect
+        
+        # Apply dispersion (diffusion) to smooth flow field
+        flow_diffused = self.diffuse_field_kernal(self.flowfield)
+        self.flowfield = (1 - flow_diffusion_rate) * self.flowfield + flow_diffusion_rate * flow_diffused
         
         # Damping
         self.flowfield *= (1.0 - self.damping)
@@ -230,15 +249,18 @@ class WorldStep:
         self.curlfield = (1 - curl_diffusion_rate) * self.curlfield + curl_diffusion_rate * curl_diffused
 
     def step_particles(self, dt=0.1):
-        """Advect particles using flow field."""
-        # Track previous positions
+        """Advect both particle sets using flow field."""
+        # Track previous positions for both sets
         self.particles_prev = cp.copy(self.particles)
+        self.particles2_prev = cp.copy(self.particles2)
         
         # Get impulse from gradient field (flow field influences particle motion)
         flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
+        flow_contrib2 = self.compute_gradient_contributions(self.particles2, self.flowfield)
         
-        # Update velocity and position
+        # Update velocity and position for both sets
         self.particles += flow_contrib * dt
+        self.particles2 += flow_contrib2 * dt
         
         # Apply toroidal wrapping/boundary conditions
         # Domain bounds: [-L*NX/2, L*NX/2] in each dimension
@@ -250,6 +272,10 @@ class WorldStep:
         self.particles[..., 0] = cp.mod(self.particles[..., 0] + half_lx, self.LX * self.NX) - half_lx
         self.particles[..., 1] = cp.mod(self.particles[..., 1] + half_ly, self.LY * self.NY) - half_ly
         self.particles[..., 2] = cp.mod(self.particles[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
+        
+        self.particles2[..., 0] = cp.mod(self.particles2[..., 0] + half_lx, self.LX * self.NX) - half_lx
+        self.particles2[..., 1] = cp.mod(self.particles2[..., 1] + half_ly, self.LY * self.NY) - half_ly
+        self.particles2[..., 2] = cp.mod(self.particles2[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
 
 
     def clamp_magnitude_gpu(points, max_len):
@@ -359,23 +385,28 @@ class WorldStep:
     # -------------------------
     def build_point_vertices(self):
         """
-        Returns a CuPy array of shape (NZ, NY, NX, 6):
+        Returns a CuPy array of shape (2*NZ*NY*NX, 6):
           [x, y, z, r, g, b]
-        for point cloud visualization.
+        for point cloud visualization with two particle sets.
+        First 50% colored by velocity, second 50% colored cyan.
         """
-        verts = cp.empty((self.NZ * self.NY * self.NX, 6), dtype=cp.float32)
+        n_particles = self.NZ * self.NY * self.NX
+        verts = cp.empty((2 * n_particles, 6), dtype=cp.float32)
 
-        # Positions
-        verts[..., 0:3] = self.particles
-
-        # Colors
+        # First particle set: positions and velocity-based colors
+        verts[0:n_particles, 0:3] = self.particles
         A = self.particles - self.particles_prev
         mag_A = cp.sqrt(A[..., 0]**2 + A[..., 1]**2 + A[..., 2]**2) + 1e-6
         normA = A / mag_A[:, cp.newaxis]
+        verts[0:n_particles, 3] = normA[..., 0] * 0.5 + 0.5
+        verts[0:n_particles, 4] = normA[..., 1] * 0.5 + 0.5
+        verts[0:n_particles, 5] = normA[..., 2] * 0.5 + 0.5
 
-        verts[..., 3] = normA[..., 0] * 0.5 + 0.5
-        verts[..., 4] = normA[..., 1] * 0.5 + 0.5
-        verts[..., 5] = normA[..., 2] * 0.5 + 0.5
+        # Second particle set: positions and fixed cyan color
+        verts[n_particles:2*n_particles, 0:3] = self.particles2
+        verts[n_particles:2*n_particles, 3] = 0.2  # cyan: low red
+        verts[n_particles:2*n_particles, 4] = 0.9  # cyan: high green
+        verts[n_particles:2*n_particles, 5] = 0.9  # cyan: high blue
 
         return verts
 

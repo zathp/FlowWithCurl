@@ -6,6 +6,11 @@ class WorldStep:
 
 
 
+    # k1 in grid kernel for diffusion and curl calculation
+    # k2 out of grid kernel for divergence and gradient calculation
+    # k3 in grid kernel for density field diffusion
+    # k4 in grid kernel for double gradient calculation
+    # k5 in grid kernel for local mean calculation
 
     def __init__(
             self,

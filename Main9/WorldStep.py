@@ -26,24 +26,31 @@ class WorldStep:
         self.LZ = lz
         self.seed = seed
 
+        # base magnitude for flow vectors
+        self.base_eddy = float(base_eddy)
         self.dispersion = dispersion
         self.particle_mass = particle_mass
 
+        #initialize kernel average weights for normalization
         self.k1_size = k1_size
         self.k2_size = k2_size
+        self.k3_size = k3_size
+        self.k4_size = k4_size
+
         self.init_kernels()
-
-        # Initialize fields
-
+        # initialize fields to zeros (curl/density); flow is seeded below
         self.particles = self.generate_initial_particles(nx, ny, nz,
             origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz))
         self.particles_prev = cp.copy(self.particles)
         # initialize fields to zeros to avoid uninitialized memory
         self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.curlfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.flowfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.flowfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
 
         self.init_densityfield()
+        self.init_flowfield(seed=seed, magnitude=2.0)
         pass
 
     def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0)):
@@ -67,16 +74,36 @@ class WorldStep:
                     self.ahat1_weight += math.exp(self.dispersion * r)
 
         self.ahat2_weight = 0.0
-        for i in range(-self.k2_size, self.k2_size+1):
-            for j in range(-self.k2_size, self.k2_size+1):
-                for k in range(-self.k2_size, self.k2_size+1):
-                    r = math.sqrt(i*i + j*j + k*k)
+        for i in range(-self.k2_size, self.k2_size):
+            for j in range(-self.k2_size, self.k2_size):
+                for k in range(-self.k2_size, self.k2_size):
+                    r = math.sqrt((i+0.5)*(i+0.5) + (j+0.5)*(j+0.5) + (k+0.5)*(k+0.5))
                     self.ahat2_weight += r/(1 + r*r)
 
     def init_densityfield(self):
         # Properly initialize densityfield with random values in [-1,1]
         self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
         return self.densityfield
+
+    def init_flowfield(self, seed=None, magnitude=None):
+        """Initialize `self.flowfield` as random directions with uniform magnitude.
+
+        - `seed`: optional RNG seed (defaults to self.seed)
+        - `magnitude`: if provided overrides `self.base_eddy`
+        """
+        if seed is None:
+            seed = int(getattr(self, "seed", 0))
+        mag = float(magnitude) if magnitude is not None else float(self.base_eddy)
+
+        rng = cp.random.RandomState(seed)
+        shape = (self.NZ, self.NY, self.NX, 3)
+        # Draw normal components, normalize to unit vectors, then scale
+        vecs = rng.normal(loc=0.0, scale=1.0, size=shape).astype(cp.float32)
+        norms = cp.linalg.norm(vecs, axis=-1, keepdims=True)
+        norms = cp.where(norms == 0, 1e-9, norms)
+        dirs = vecs / norms
+        self.flowfield = dirs * mag
+        return self.flowfield
     
     def calculate_gradientfield_kernal(self, field):
         gradientfield = cp.zeros_like(field)
@@ -94,9 +121,9 @@ class WorldStep:
     
     def calculate_divergence_from_flow_kernal(self, field):
         divergencefield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
-        for i in range(-self.k2_size, self.k2_size):
-            for j in range(-self.k2_size, self.k2_size):
-                for k in range(-self.k2_size, self.k2_size):
+        for i in range(-self.k2_size + 1, self.k2_size + 1):
+            for j in range(-self.k2_size + 1, self.k2_size + 1):
+                for k in range(-self.k2_size + 1, self.k2_size + 1):
                     r = math.sqrt((i - 0.5)*(i - 0.5) + (j - 0.5)*(j - 0.5) + (k - 0.5)*(k - 0.5))
                     weight = r/(1 + r*r) / self.ahat2_weight
                     shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
@@ -105,9 +132,9 @@ class WorldStep:
     
     def calculate_curlfield_kernal(self, field):
         curlfield = cp.empty((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
-        for i in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
-            for j in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
-                for k in range(-(self.k1_size-1)/2, (self.k1_size-1)/2 + 1):
+        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
                     r = math.sqrt(i*i + j*j + k*k)
                     weight = math.exp(self.dispersion * r) / self.ahat1_weight
                     shifted = cp.roll(field, shift=(i, j, k), axis=(0, 1, 2))
@@ -133,8 +160,8 @@ class WorldStep:
 
     def step(self, dt=0.1):
         self.step_densityfield(dt)
-        gradientfield = self.calculate_gradientfield()
-        self.step_flowfield(dt, gradientfield)
+        gradientfield = self.calculate_gradientfield_kernal(self.densityfield)
+        self.step_flowfield(dt)
         self.step_curlfield(dt)
         self.step_particles(dt)
         pass
@@ -145,12 +172,12 @@ class WorldStep:
         density_diffused = self.diffuse_field_kernal(self.densityfield)
         self.densityfield = (1 - diffusion_rate) * self.densityfield + diffusion_rate * density_diffused
 
-        self.densityfield += cp.sum(self.calculate_gradientfield_kernal(self.flowfield), (3,4)) * dt
+        self.densityfield += self.calculate_divergence_from_flow_kernal(self.flowfield) * dt
         pass
 
-    def step_flowfield(self, gradientfield, dt=0.1):
+    def step_flowfield(self, dt=0.1):
         self.flowfield += self.calculate_gradientfield_kernal(self.densityfield) * dt
-        eddyflowfield += self.calculate_curlfield_kernal(self.curlfield)
+        eddyflowfield = self.calculate_curlfield_kernal(self.curlfield - self.curlfield_prev)
         pass
 
     def step_curlfield(self, dt=0.1):
@@ -159,7 +186,7 @@ class WorldStep:
     def step_particles(self, dt=0.1):
         particleMotion = self.particles - self.particles_prev
 
-        impulse = self.compute_gradient_contributions(self.particles, self.calculate_gradientfield(), self.curlfield)
+        impulse = self.compute_gradient_contributions(self.particles, self.flowfield)
         print(impulse)
 
         particleMotion += impulse * (dt / self.particle_mass)

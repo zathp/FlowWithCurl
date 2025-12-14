@@ -12,12 +12,15 @@ POINTS_VERT = """
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 color_in;
 layout(location = 2) in float size_in;
+layout(location = 3) in float alpha_in;
 uniform mat4 mvp;
 uniform float min_size;
 out vec3 color;
+out float alpha;
 void main() {
     gl_Position = mvp * vec4(position, 1.0);
     color = color_in;
+    alpha = alpha_in;
     gl_PointSize = max(size_in, min_size);
 }
 """
@@ -25,9 +28,10 @@ void main() {
 POINTS_FRAG = """
 #version 330 core
 in vec3 color;
+in float alpha;
 out vec4 out_col;
 void main() {
-    out_col = vec4(color, 1.0);
+    out_col = vec4(color, alpha);
 }
 """
 
@@ -36,7 +40,7 @@ def _create_shader():
     return compileProgram(compileShader(POINTS_VERT, gl.GL_VERTEX_SHADER), compileShader(POINTS_FRAG, gl.GL_FRAGMENT_SHADER))
 
 
-def run_viewer(sim, width=1000, height=800):
+def run_viewer(sim, width=1000, height=800, print_timings=False):
     if not glfw.init():
         raise RuntimeError("Failed to init GLFW")
 
@@ -62,9 +66,9 @@ def run_viewer(sim, width=1000, height=800):
     vbo = gl.glGenBuffers(1)
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
     # allocate initial empty buffer (will update each frame)
-    max_points = sim.NX * sim.NY * sim.NZ
+    max_points = sim.num_particles
     float_size = 4
-    vertex_stride = 7 * float_size  # position(3) + color(3) + size(1)
+    vertex_stride = 8 * float_size  # position(3) + color(3) + size(1) + alpha(1)
     gl.glBufferData(gl.GL_ARRAY_BUFFER, max_points * vertex_stride, None, gl.GL_DYNAMIC_DRAW)
 
     # position attribute
@@ -76,6 +80,9 @@ def run_viewer(sim, width=1000, height=800):
     # size attribute
     gl.glEnableVertexAttribArray(2)
     gl.glVertexAttribPointer(2, 1, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, gl.ctypes.c_void_p(24))
+    # alpha attribute
+    gl.glEnableVertexAttribArray(3)
+    gl.glVertexAttribPointer(3, 1, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, gl.ctypes.c_void_p(28))
 
     # Bounding box line setup (12 edges * 2 vertices)
     box_vao = gl.glGenVertexArrays(1)
@@ -89,16 +96,45 @@ def run_viewer(sim, width=1000, height=800):
     # enable depth test
     gl.glEnable(gl.GL_DEPTH_TEST)
     gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+    gl.glEnable(gl.GL_BLEND)
+    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+
+    # Camera setup - must be before key_cb definition
+    x_min = -50.0
+    x_max = 50.0
+    y_min = -50.0
+    y_max = 50.0
+    z_min = -5.0
+    z_max = 5.0
+    
+    radius = 150.0
+    eye = np.array([120.0, 80.0, 60.0], dtype=np.float32)
+    center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    
+    # Initialize camera state
+    camera_radius = float(radius)
+    dir_vec_init = eye - center
+    dir_len = np.linalg.norm(dir_vec_init) + 1e-9
+    dir_unit = dir_vec_init / dir_len
+    initial_pitch = float(np.arcsin(dir_unit[2]))
+    initial_yaw = float(np.arctan2(dir_unit[1], dir_unit[0]))
+    yaw = initial_yaw
+    pitch = initial_pitch
+    
+    # Camera bounds
+    cam_bounds_min = np.array([-200.0, -200.0, -50.0], dtype=np.float32)
+    cam_bounds_max = np.array([200.0, 200.0, 50.0], dtype=np.float32)
 
     paused = True
     step_once = False
     sample_once = False
-    camera_radius = 1.0
-    render_mode = "points"  # or "vectors"
+    render_mode = "points"  # "points", "vectors", or "density"
     vector_field_choice = "flow"  # 'flow' or 'curl'
+    density_field_choice = 1  # 1 or 2
 
     def key_cb(window, key, scancode, action, mods):
-        nonlocal paused, step_once, sample_once, camera_radius, center, yaw, pitch, up, render_mode, vector_field_choice
+        nonlocal paused, step_once, sample_once, camera_radius, center, yaw, pitch, up, render_mode, vector_field_choice, density_field_choice
         if action == glfw.PRESS:
             if key == glfw.KEY_SPACE:
                 paused = not paused
@@ -121,8 +157,17 @@ def run_viewer(sim, width=1000, height=800):
                     pitch = initial_pitch
                 except Exception:
                     pass
+            elif key == glfw.KEY_M:
+                # cycle render mode: points -> vectors -> density -> points
+                if render_mode == "points":
+                    render_mode = "vectors"
+                elif render_mode == "vectors":
+                    render_mode = "density"
+                else:
+                    render_mode = "points"
+                print("Render mode:", render_mode)
             elif key == glfw.KEY_V:
-                # toggle render mode between points and vectors
+                # toggle render mode between points and vectors (legacy)
                 if render_mode == "points":
                     render_mode = "vectors"
                 else:
@@ -135,6 +180,10 @@ def run_viewer(sim, width=1000, height=800):
                 else:
                     vector_field_choice = "flow"
                 print("Vector field:", vector_field_choice)
+            elif key == glfw.KEY_F:
+                # toggle density field choice (1 or 2)
+                density_field_choice = 2 if density_field_choice == 1 else 1
+                print("Density field:", density_field_choice)
             # keyboard movement: j=strafe left, l=strafe right, i=forward, k=back
             elif key == glfw.KEY_J:
                 # strafe left
@@ -209,16 +258,11 @@ def run_viewer(sim, width=1000, height=800):
         except Exception:
             camera_radius *= (0.9 if yoffset > 0 else 1.1)
 
-    # Camera bounding box (allows camera center to move outside particle box)
-    cam_bounds_min = np.array([-200.0, -200.0, -50.0], dtype=np.float32)
-    cam_bounds_max = np.array([200.0, 200.0, 50.0], dtype=np.float32)
     # camera radius limits
     cam_radius_min = 1.0
     cam_radius_max = 2000.0
 
     # mouse / camera interaction state
-    yaw = 0.0
-    pitch = 0.0
     rotating = False
     panning = False
     last_x = 0.0
@@ -275,94 +319,13 @@ def run_viewer(sim, width=1000, height=800):
     glfw.set_mouse_button_callback(window, mouse_button_cb)
     glfw.set_cursor_pos_callback(window, cursor_pos_cb)
 
-    def build_vector_vertices(sim, field_name="flow", stride=4, scale=1.0):
-        """Build line segment endpoints for sampled vector field.
-
-        Returns a numpy array of shape (M,6) with [x,y,z,r,g,b] for each vertex.
-        Each vector becomes two vertices (start, end).
-        """
-        # choose field
-        if field_name == "flow":
-            field_cp = sim.flowfield
-        else:
-            field_cp = sim.curlfield
-
-        # copy to host
-        try:
-            field = cp.asnumpy(field_cp)
-        except Exception:
-            field = np.asarray(field_cp)
-
-        nz, ny, nx, _ = field.shape
-        # grid centers
-        ox = -sim.LX * (sim.NX - 1) / 2.0
-        oy = -sim.LY * (sim.NY - 1) / 2.0
-        oz = -sim.LZ * (sim.NZ - 1) / 2.0
-
-        idxs = []
-        for iz in range(0, nz, stride):
-            for iy in range(0, ny, stride):
-                for ix in range(0, nx, stride):
-                    idxs.append((iz, iy, ix))
-
-        out = np.empty((len(idxs) * 2, 7), dtype=np.float32)
-        vi = 0
-        # scale factor relative to cell size
-        cell_scale = max(sim.LX, sim.LY, sim.LZ)
-        for (iz, iy, ix) in idxs:
-            cx = ox + ix * sim.LX
-            cy = oy + iy * sim.LY
-            cz = oz + iz * sim.LZ
-            vec = field[iz, iy, ix]
-            mag = np.linalg.norm(vec) + 1e-9
-            dirv = vec / mag
-            end = np.array([cx, cy, cz], dtype=np.float32) + dirv.astype(np.float32) * (scale * cell_scale * 0.5)
-            # color by direction (normalized to 0..1)
-            color = (np.abs(dirv) * 0.5 + 0.25).astype(np.float32)
-            out[vi, 0:3] = [cx, cy, cz]
-            out[vi, 3:6] = color
-            out[vi, 6] = 1.0  # size placeholder
-            vi += 1
-            out[vi, 0:3] = end
-            out[vi, 3:6] = color
-            out[vi, 6] = 1.0
-            vi += 1
-        return out
-
-    # camera setup (fixed orbit)
-    # Use the requested fixed bounding box: (-50,-50,-5) .. (50,50,5)
-    x_min = -50.0
-    x_max = 50.0
-    y_min = -50.0
-    y_max = 50.0
-    z_min = -5.0
-    z_max = 5.0
-
-    # Position camera outside the particle bounding box looking at center
-    # Camera positioned at a comfortable distance to view the entire box
-    radius = 150.0
-    # Start camera in front and above the box (positive x, y, z all outside box bounds)
-    eye = np.array([120.0, 80.0, 60.0], dtype=np.float32)
-    center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
     # Use perspective projection
     fov = 60.0  # field of view in degrees
     aspect = width / height
     near = 1.0
     far = 5000.0
     proj = pyrr.matrix44.create_perspective_projection_matrix(fov, aspect, near, far, dtype=np.float32)
-    # initialize camera radius and derive initial yaw/pitch from eye
-    camera_radius = float(radius)
-    dir_vec_init = eye - center
-    dir_len = np.linalg.norm(dir_vec_init) + 1e-9
-    dir_unit = dir_vec_init / dir_len
-    initial_pitch = float(np.arcsin(dir_unit[2]))
-    initial_yaw = float(np.arctan2(dir_unit[1], dir_unit[0]))
-    yaw = initial_yaw
-    pitch = initial_pitch
-    view = pyrr.matrix44.create_look_at(eye, center, up, dtype=np.float32)
-
+    
     mvp_loc = gl.glGetUniformLocation(shader, "mvp")
     min_size_loc = gl.glGetUniformLocation(shader, "min_size")
 
@@ -374,8 +337,6 @@ def run_viewer(sim, width=1000, height=800):
 
     # edges as index pairs
     edges = [(0,1),(1,2),(2,3),(3,0), (4,5),(5,6),(6,7),(7,4), (0,4),(1,5),(2,6),(3,7)]
-    line_verts = np.array([corners[a] for a,b in edges for a in (a,)], dtype=np.float32) # will replace below
-    # build line vertex array as sequence of pairs
     line_verts = np.empty((len(edges)*2,3), dtype=np.float32)
     idx = 0
     for a,b in edges:
@@ -399,13 +360,15 @@ def run_viewer(sim, width=1000, height=800):
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
 
         if (not paused) or step_once:
-            sim.step(0.05)
+            sim.step(0.05, print_timings=print_timings)
             step_once = False
 
-        # upload either particle vertices or vector vertices depending on render mode
+        # upload vertices depending on render mode
         if render_mode == "points":
-            verts_cp = sim.build_point_vertices()  # cupy array (N,6)
+            verts_cp = sim.build_point_vertices()  # cupy array (N,8)
             verts = np.asarray(cp.asnumpy(verts_cp), dtype=np.float32)
+        elif render_mode == "density":
+            verts = build_density_vertices(sim, density_field_choice)
         else:
             # build vector lines (sampled)
             # choose stride so we don't overload the GPU
@@ -464,7 +427,7 @@ def run_viewer(sim, width=1000, height=800):
                 print(f"Frame {frame}: points={verts.shape[0]} (no position stats)")
         frame += 1
 
-        if render_mode == "points":
+        if render_mode == "points" or render_mode == "density":
             gl.glDrawArrays(gl.GL_POINTS, 0, verts.shape[0])
         else:
             # vectors drawn as lines (each vector is two vertices)
@@ -484,3 +447,109 @@ def run_viewer(sim, width=1000, height=800):
         glfw.poll_events()
 
     glfw.terminate()
+
+def build_density_vertices(sim, field_choice=1):
+    """Build vertex array for volumetric density field rendering.
+    Returns (N, 8) array: [x, y, z, r, g, b, size, alpha]
+    """
+    field = sim.densityfield if field_choice == 1 else sim.densityfield2
+    field_np = cp.asnumpy(field)  # (NZ, NY, NX)
+    
+    # Create grid positions
+    x = np.linspace(-sim.LX * (sim.NX - 1) / 2, sim.LX * (sim.NX - 1) / 2, sim.NX)
+    y = np.linspace(-sim.LY * (sim.NY - 1) / 2, sim.LY * (sim.NY - 1) / 2, sim.NY)
+    z = np.linspace(-sim.LZ * (sim.NZ - 1) / 2, sim.LZ * (sim.NZ - 1) / 2, sim.NZ)
+    
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    positions = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)  # (N, 3)
+    
+    # Flatten density values
+    density_values = field_np.T.flatten()  # (N,)
+    
+    # Map density to color (blue=negative, red=positive) and alpha
+    colors = np.zeros((len(density_values), 3), dtype=np.float32)
+    alphas = np.abs(density_values)
+    
+    # Normalize alpha to reasonable range
+    alpha_max = np.percentile(alphas, 95) if alphas.max() > 0 else 1.0
+    alphas = np.clip(alphas / (alpha_max + 1e-6), 0.0, 1.0)
+    
+    # Color based on sign: negative=blue, positive=red, zero=white
+    pos_mask = density_values > 0
+    neg_mask = density_values < 0
+    
+    colors[pos_mask, 0] = 1.0  # red for positive
+    colors[pos_mask, 1] = 0.3
+    colors[pos_mask, 2] = 0.3
+    
+    colors[neg_mask, 0] = 0.3
+    colors[neg_mask, 1] = 0.3
+    colors[neg_mask, 2] = 1.0  # blue for negative
+    
+    # Size based on density magnitude
+    sizes = 5.0 + 15.0 * alphas
+    
+    # Scale alpha for better visibility
+    alphas = alphas * 0.5
+    
+    # Combine into vertex array (x, y, z, r, g, b, size, alpha)
+    vertices = np.column_stack([positions, colors, sizes, alphas]).astype(np.float32)
+    
+    return vertices
+
+
+def build_vector_vertices(sim, field_name="flow", stride=4, scale=1.0):
+    """Build line segment endpoints for sampled vector field.
+
+    Returns a numpy array of shape (M,8) with [x,y,z,r,g,b,size,alpha] for each vertex.
+    Each vector becomes two vertices (start, end).
+    """
+    # choose field
+    if field_name == "flow":
+        field_cp = sim.flowfield
+    else:
+        field_cp = sim.curlfield
+
+    # copy to host
+    try:
+        field = cp.asnumpy(field_cp)
+    except Exception:
+        field = np.asarray(field_cp)
+
+    nz, ny, nx, _ = field.shape
+    # grid centers
+    ox = -sim.LX * (sim.NX - 1) / 2.0
+    oy = -sim.LY * (sim.NY - 1) / 2.0
+    oz = -sim.LZ * (sim.NZ - 1) / 2.0
+
+    idxs = []
+    for iz in range(0, nz, stride):
+        for iy in range(0, ny, stride):
+            for ix in range(0, nx, stride):
+                idxs.append((iz, iy, ix))
+
+    out = np.empty((len(idxs) * 2, 8), dtype=np.float32)
+    vi = 0
+    # scale factor relative to cell size
+    cell_scale = max(sim.LX, sim.LY, sim.LZ)
+    for (iz, iy, ix) in idxs:
+        cx = ox + ix * sim.LX
+        cy = oy + iy * sim.LY
+        cz = oz + iz * sim.LZ
+        vec = field[iz, iy, ix]
+        mag = np.linalg.norm(vec) + 1e-9
+        dirv = vec / mag
+        end = np.array([cx, cy, cz], dtype=np.float32) + dirv.astype(np.float32) * (scale * cell_scale * 0.5)
+        # color by direction (normalized to 0..1)
+        color = (np.abs(dirv) * 0.5 + 0.25).astype(np.float32)
+        out[vi, 0:3] = [cx, cy, cz]
+        out[vi, 3:6] = color
+        out[vi, 6] = 1.0  # size placeholder
+        out[vi, 7] = 1.0  # alpha (opaque)
+        vi += 1
+        out[vi, 0:3] = end
+        out[vi, 3:6] = color
+        out[vi, 6] = 1.0
+        out[vi, 7] = 1.0  # alpha (opaque)
+        vi += 1
+    return out

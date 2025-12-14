@@ -17,6 +17,7 @@ def main():
         k2_size=3,
         k3_size=3,
         k4_size=2,
+        k5_size=3
     )
     run_viewer(sim)
 

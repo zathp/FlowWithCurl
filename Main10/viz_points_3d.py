@@ -338,22 +338,20 @@ def run_viewer(sim, width=1000, height=800):
     z_min = -5.0
     z_max = 5.0
 
-    # pick a radius that comfortably frames the box
-    radius = max(abs(x_min), abs(x_max), abs(y_min), abs(y_max), abs(z_min), abs(z_max)) * 2.0
-    eye = np.array([radius, radius * 0.6, radius * 0.9], dtype=np.float32)
+    # Position camera outside the particle bounding box looking at center
+    # Camera positioned at a comfortable distance to view the entire box
+    radius = 150.0
+    # Start camera in front and above the box (positive x, y, z all outside box bounds)
+    eye = np.array([120.0, 80.0, 60.0], dtype=np.float32)
     center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
-    # Use orthographic projection that exactly covers the fixed bounding box (with small margin)
-    margin_x = 1.0
-    margin_y = 1.0
-    left = x_min - margin_x
-    right = x_max + margin_x
-    bottom = y_min - margin_y
-    top = y_max + margin_y
-    near = -1000.0
-    far = 1000.0
-    proj = pyrr.matrix44.create_orthogonal_projection_matrix(left, right, bottom, top, near, far, dtype=np.float32)
+    # Use perspective projection
+    fov = 60.0  # field of view in degrees
+    aspect = width / height
+    near = 1.0
+    far = 5000.0
+    proj = pyrr.matrix44.create_perspective_projection_matrix(fov, aspect, near, far, dtype=np.float32)
     # initialize camera radius and derive initial yaw/pitch from eye
     camera_radius = float(radius)
     dir_vec_init = eye - center

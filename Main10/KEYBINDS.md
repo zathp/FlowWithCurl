@@ -11,7 +11,6 @@
 | Key | Action |
 |-----|--------|
 | **M** | Cycle render modes: Points → Vectors → Density → Points |
-| **V** | Toggle between Points and Vectors mode (legacy) |
 | **B** | Toggle vector field display: Flow ↔ Curl |
 | **F** | Toggle density field: Field 1 ↔ Field 2 |
 

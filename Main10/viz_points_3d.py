@@ -100,17 +100,33 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
 
     # Camera setup - must be before key_cb definition
-    x_min = -50.0
-    x_max = 50.0
-    y_min = -50.0
-    y_max = 50.0
-    z_min = -5.0
-    z_max = 5.0
+    # Calculate bounding box from simulation dimensions
+    x_min = -sim.LX * (sim.NX - 1) / 2.0
+    x_max = sim.LX * (sim.NX - 1) / 2.0
+    y_min = -sim.LY * (sim.NY - 1) / 2.0
+    y_max = sim.LY * (sim.NY - 1) / 2.0
+    z_min = -sim.LZ * (sim.NZ - 1) / 2.0
+    z_max = sim.LZ * (sim.NZ - 1) / 2.0
     
-    radius = 150.0
-    eye = np.array([120.0, 80.0, 60.0], dtype=np.float32)
-    center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    # Calculate appropriate initial camera position based on simulation size
+    sim_extent = max(x_max - x_min, y_max - y_min, z_max - z_min)
+    radius = sim_extent * 1.5
+    
+    # Always use Z as the world up axis for consistent camera rotation
     up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    
+    # Position camera to view the dominant plane
+    # If it's a 2D simulation (one dimension is very small), position camera accordingly
+    if sim.NZ <= 2:  # XY plane (looking down Z axis)
+        eye = np.array([0.0, 0.0, radius], dtype=np.float32)
+    elif sim.NY <= 2:  # XZ plane (looking down Y axis)
+        eye = np.array([0.0, radius, 0.0], dtype=np.float32)
+    elif sim.NX <= 2:  # YZ plane (looking down X axis)
+        eye = np.array([radius, 0.0, 0.0], dtype=np.float32)
+    else:  # 3D simulation - use angled view
+        eye = np.array([radius * 0.6, radius * 0.6, radius * 0.4], dtype=np.float32)
+    
+    center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     
     # Initialize camera state
     camera_radius = float(radius)
@@ -121,10 +137,11 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
     initial_yaw = float(np.arctan2(dir_unit[1], dir_unit[0]))
     yaw = initial_yaw
     pitch = initial_pitch
+    roll = np.pi / 2  # Camera roll angle around view direction
     
-    # Camera bounds
-    cam_bounds_min = np.array([-200.0, -200.0, -50.0], dtype=np.float32)
-    cam_bounds_max = np.array([200.0, 200.0, 50.0], dtype=np.float32)
+    # Camera bounds based on simulation extent
+    cam_bounds_min = np.array([x_min * 2, y_min * 2, z_min * 2], dtype=np.float32)
+    cam_bounds_max = np.array([x_max * 2, y_max * 2, z_max * 2], dtype=np.float32)
 
     paused = True
     step_once = False
@@ -163,13 +180,6 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
                     render_mode = "vectors"
                 elif render_mode == "vectors":
                     render_mode = "density"
-                else:
-                    render_mode = "points"
-                print("Render mode:", render_mode)
-            elif key == glfw.KEY_V:
-                # toggle render mode between points and vectors (legacy)
-                if render_mode == "points":
-                    render_mode = "vectors"
                 else:
                     render_mode = "points"
                 print("Render mode:", render_mode)
@@ -264,19 +274,26 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
 
     # mouse / camera interaction state
     rotating = False
+    rolling = False
     panning = False
     last_x = 0.0
     last_y = 0.0
 
     def mouse_button_cb(window, button, action, mods):
-        nonlocal rotating, panning, last_x, last_y
+        nonlocal rotating, rolling, panning, last_x, last_y
         if button == glfw.MOUSE_BUTTON_LEFT:
             if action == glfw.PRESS:
                 rotating = True
                 last_x, last_y = glfw.get_cursor_pos(window)
             elif action == glfw.RELEASE:
                 rotating = False
-        if button == glfw.MOUSE_BUTTON_MIDDLE or button == glfw.MOUSE_BUTTON_RIGHT:
+        if button == glfw.MOUSE_BUTTON_MIDDLE:
+            if action == glfw.PRESS:
+                rolling = True
+                last_x, last_y = glfw.get_cursor_pos(window)
+            elif action == glfw.RELEASE:
+                rolling = False
+        if button == glfw.MOUSE_BUTTON_RIGHT:
             if action == glfw.PRESS:
                 panning = True
                 last_x, last_y = glfw.get_cursor_pos(window)
@@ -284,29 +301,33 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
                 panning = False
 
     def cursor_pos_cb(window, x, y):
-        nonlocal last_x, last_y, yaw, pitch, center, camera_radius
+        nonlocal last_x, last_y, yaw, pitch, roll, center, camera_radius
         dx = x - last_x
         dy = y - last_y
         last_x, last_y = x, y
         if rotating:
-            # rotate: change yaw and pitch
+            # rotate: change yaw and pitch in world space
+            # yaw rotates around world Z axis (vertical/horizon rotation)
+            # pitch tilts camera up/down from horizontal plane
             yaw += dx * 0.005
             pitch += -dy * 0.005
-            # clamp pitch to avoid flip
+            # clamp pitch to avoid flip (can't look straight up/down)
             limit = 1.49
             if pitch > limit:
                 pitch = limit
             if pitch < -limit:
                 pitch = -limit
+        elif rolling:
+            # roll: rotate camera around its view direction
+            roll += dx * 0.005
         elif panning:
             # pan: move the center in camera plane
             # compute current eye and basis
-            dir_vec = np.array([np.cos(pitch) * np.cos(yaw), np.cos(pitch) * np.sin(yaw), np.sin(pitch)], dtype=np.float32)
+            dir_vec = np.array([np.cos(pitch) * np.cos(roll), np.cos(pitch) * np.sin(roll), np.sin(pitch)], dtype=np.float32)
             eye_pos = center + dir_vec * camera_radius
             forward = center - eye_pos
             forward = forward / (np.linalg.norm(forward) + 1e-9)
-            right = np.cross(forward, up)
-            right = right / (np.linalg.norm(right) + 1e-9)
+            right = np.array([-np.sin(roll), np.cos(roll), 0.0], dtype=np.float32)
             up_cam = np.cross(right, forward)
             # scale movement by radius
             scale = camera_radius * 0.002
@@ -385,10 +406,30 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
             gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, size, verts)
 
         # compute MVP (update eye from yaw/pitch and camera_radius)
-        dir_vec = np.array([np.cos(pitch) * np.cos(yaw), np.cos(pitch) * np.sin(yaw), np.sin(pitch)], dtype=np.float32)
+        # Spherical coordinates with Z as world up axis:
+        # yaw = rotation around Z axis (azimuth)
+        # pitch = elevation angle from XY plane
+        dir_vec = np.array([np.cos(pitch) * np.cos(roll), np.cos(pitch) * np.sin(roll), np.sin(pitch)], dtype=np.float32)
         eye = center + dir_vec * camera_radius
-        view = pyrr.matrix44.create_look_at(eye, center, up, dtype=np.float32)
+        
+        # Compute up vector with roll applied
+        # For yaw/pitch camera, compute right vector directly from yaw (horizontal rotation)
+        right = np.array([-np.sin(roll), np.cos(roll), 0.0], dtype=np.float32)
+        # Compute proper up vector perpendicular to both view and right
+        view_dir = center - eye
+        view_dir = view_dir / (np.linalg.norm(view_dir) + 1e-9)
+        camera_up = np.cross(right, view_dir)
+        camera_up = camera_up / (np.linalg.norm(camera_up) + 1e-9)
+        
+        # Apply roll rotation around view direction
+        rolled_up = camera_up * np.cos(yaw) + right * np.sin(yaw)
+        
+        view = pyrr.matrix44.create_look_at(eye, center, rolled_up, dtype=np.float32)
         mvp = proj @ view
+        #print("--------------------------------------------------")
+        #print(proj)
+        #print(view)
+        #print(mvp)
         # OpenGL expects column-major matrix data; pyrr returns row-major arrays.
         mvp_upload = mvp.T.astype(np.float32)
         gl.glUseProgram(shader)

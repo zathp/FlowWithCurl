@@ -20,6 +20,12 @@ class WorldStep:
             particle_mass1=1.0,
             particle_mass2=1.0,
             particle_dispersion=1,
+            enable_particles=True,
+            particle_velocity_max=5.0,
+            density1_injection_strength_pos=0.3,
+            density1_injection_strength_neg=0.3,
+            density2_injection_strength=0.5,
+            density2_follow_strength=0.0,
             nx=50, ny=50, nz=50,
             lx=4.0, ly=4.0, lz=4.0,
             k1_size=3, k2_size=2, k3_size=3, k4_size=2, k5_size=2,
@@ -39,6 +45,16 @@ class WorldStep:
         self.particle_mass1 = particle_mass1
         self.particle_mass2 = particle_mass2
         self.damping = damping
+        self.enable_particles = enable_particles
+        
+        # Particle behavior parameters
+        self.particle_velocity_max = particle_velocity_max
+        self.density2_follow_strength = density2_follow_strength
+        
+        # Density injection strengths
+        self.density1_injection_strength_pos = density1_injection_strength_pos
+        self.density1_injection_strength_neg = density1_injection_strength_neg
+        self.density2_injection_strength = density2_injection_strength
 
         #initialize kernel average weights for normalization
         self.k1_size = k1_size
@@ -49,15 +65,24 @@ class WorldStep:
 
         self.init_kernels()
         # initialize fields to zeros (curl/density); flow is seeded below
-        self.particles = self.generate_initial_particles(nx, ny, nz,
-            origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
-            , step=particle_dispersion)
-        self.particles_prev = cp.copy(self.particles)
-        # second particle set (initialized with slight offset)
-        self.particles2 = self.generate_initial_particles(nx, ny, nz,
-            origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
-            , step=particle_dispersion)
-        self.particles2_prev = cp.copy(self.particles2)
+        if enable_particles:
+            self.particles = self.generate_initial_particles(nx, ny, nz,
+                origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+                , step=particle_dispersion)
+            self.particles_vel = cp.zeros_like(self.particles)
+            # second particle set (initialized with slight offset)
+            self.particles2 = self.generate_initial_particles(nx, ny, nz,
+                origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+                , step=particle_dispersion)
+            self.particles2_vel = cp.zeros_like(self.particles2)
+            self.num_particles = self.particles.shape[0]
+        else:
+            # Create empty particle arrays
+            self.particles = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles_vel = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles2 = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles2_vel = cp.zeros((0, 3), dtype=cp.float32)
+            self.num_particles = 0
         # initialize fields to zeros to avoid uninitialized memory
         self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.curlfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
@@ -255,17 +280,18 @@ class WorldStep:
         self.step_curlfield(dt, print_timings=print_timings)
         timings['curlfield'] = time.perf_counter() - t0
         
-        t0 = time.perf_counter()
-        self.step_particles(dt)
-        timings['particles'] = time.perf_counter() - t0
-        
-        t0 = time.perf_counter()
-        self.inject_particles_to_density1(strength_pos=0.3, strength_neg=0.3)
-        timings['inject_density1'] = time.perf_counter() - t0
-        
-        t0 = time.perf_counter()
-        self.inject_particles_to_density2(strength=0.5)
-        timings['inject_density2'] = time.perf_counter() - t0
+        if self.enable_particles:
+            t0 = time.perf_counter()
+            self.step_particles(dt)
+            timings['particles'] = time.perf_counter() - t0
+            
+            t0 = time.perf_counter()
+            self.inject_particles_to_density1(strength_pos=self.density1_injection_strength_pos, strength_neg=self.density1_injection_strength_neg)
+            timings['inject_density1'] = time.perf_counter() - t0
+            
+            t0 = time.perf_counter()
+            self.inject_particles_to_density2(strength=self.density2_injection_strength)
+            timings['inject_density2'] = time.perf_counter() - t0
         
         if print_timings:
             total = sum(timings.values())
@@ -291,7 +317,7 @@ class WorldStep:
             # normalize curl magnitude to [0, 1] range for stable effect
             curl_mag_normalized = curl_mag / (cp.max(curl_mag) + 1e-9)
             # divergence contribution: positive curl magnitude = outward spreading
-            self.densityfield += curl_mag_normalized * curl_divergence_strength * dt
+            self.densityfield += curl_mag * curl_divergence_strength * dt
         
         # Clamp to reasonable range
         self.densityfield = cp.clip(self.densityfield, -1.0, 1.0)
@@ -319,7 +345,7 @@ class WorldStep:
         # Eddy/curl contribution from vorticity
         curl_change = self.curlfield - self.curlfield_prev
         eddyflowfield = self.calculate_curlfield_kernal(curl_change)
-        self.flowfield += eddyflowfield * dt * 0.5  # Scale down eddy effect
+        self.flowfield += eddyflowfield * dt * -0.5  # Scale down eddy effect
         
         # Apply dispersion (diffusion) to smooth flow field
         flow_diffused = self.diffuse_field_kernal(self.flowfield)
@@ -378,14 +404,16 @@ class WorldStep:
             for name, t in sorted(timings.items(), key=lambda x: -x[1]):
                 print(f"    {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
 
-    def step_particles(self, dt=0.1, density2_follow_strength=-0.5):
+    def step_particles(self, dt=0.1, density2_follow_strength=None):
         """Advect both particle sets using flow field and densityfield2 gradient.
         
-        density2_follow_strength: how strongly particles follow densityfield2 gradient (0 to disable)
+        density2_follow_strength: how strongly particles follow densityfield2 gradient (None uses class default)
         """
+        if density2_follow_strength is None:
+            density2_follow_strength = self.density2_follow_strength
         # Track previous positions for both sets
-        self.particles_prev = cp.copy(self.particles)
-        self.particles2_prev = cp.copy(self.particles2)
+        self.particles_vel = cp.copy(self.particles)
+        self.particles2_vel = cp.copy(self.particles2)
         
         # Get impulse from gradient field (flow field influences particle motion)
         flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
@@ -400,8 +428,31 @@ class WorldStep:
             flow_contrib2 += density2_contrib2 * density2_follow_strength
         
         # Update velocity and position for both sets
-        self.particles += flow_contrib * (dt / self.particle_mass1)
-        self.particles2 += flow_contrib2 * (dt / self.particle_mass2)
+        self.particles_vel += flow_contrib * (dt / self.particle_mass1)
+        self.particles2_vel += flow_contrib2 * (dt / self.particle_mass2)
+
+        curl_contrib = self.compute_curl_contributions(self.particles, self.curlfield)
+        curl_contrib2 = -self.compute_curl_contributions(self.particles2, self.curlfield)
+
+        curl_strength1 = cp.sqrt(cp.sum(curl_contrib * curl_contrib, axis=1)) / self.particle_mass1
+        curl_strength2 = cp.sqrt(cp.sum(curl_contrib2 * curl_contrib2, axis=1)) / self.particle_mass2
+
+        curl_strength1 = cp.stack([curl_strength1, curl_strength1, curl_strength1], axis=1)
+        curl_strength2 = cp.stack([curl_strength2, curl_strength2, curl_strength2], axis=1)
+
+        particles_vel_curl = cp.cross(self.particles_vel, curl_contrib) / (curl_strength1 * self.particle_mass1 + 1e-9)
+        particles2_vel_curl = cp.cross(self.particles2_vel, curl_contrib2) / (curl_strength2 * self.particle_mass2 + 1e-9)
+
+        self.particles_vel = self.particles_vel * cp.cos(curl_strength1 * dt) + particles_vel_curl * cp.sin(curl_strength1 * dt)
+        self.particles2_vel = self.particles2_vel * cp.cos(curl_strength2 * dt) + particles2_vel_curl * cp.sin(curl_strength2 * dt)
+
+        self.particles_vel = WorldStep.clamp_magnitude_gpu(self.particles_vel, max_len=self.particle_velocity_max)
+        self.particles2_vel = WorldStep.clamp_magnitude_gpu(self.particles2_vel, max_len=self.particle_velocity_max)
+        
+        # Update positions
+
+        self.particles += self.particles_vel * dt
+        self.particles2 += self.particles2_vel * dt
         
         # Apply toroidal wrapping/boundary conditions
         # Domain bounds: [-L*NX/2, L*NX/2] in each dimension
@@ -418,7 +469,7 @@ class WorldStep:
         self.particles2[..., 1] = cp.mod(self.particles2[..., 1] + half_ly, self.LY * self.NY) - half_ly
         self.particles2[..., 2] = cp.mod(self.particles2[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
 
-    def inject_particles_to_density2(self, strength=0.5):
+    def inject_particles_to_density2(self, strength=0.1):
         """Inject particle density into densityfield2 at particle locations.
         
         strength: how much density each particle contributes (0 to 1 range)
@@ -443,7 +494,7 @@ class WorldStep:
         
         cp.add.at(self.densityfield2, (iz2, iy2, ix2), strength)
 
-    def inject_particles_to_density1(self, strength_pos=10, strength_neg=10):
+    def inject_particles_to_density1(self, strength_pos=-.10, strength_neg=-.10):
         """Inject particles into densityfield with opposite signs by type.
 
         particles  (set1) add +strength_pos; particles2 add -strength_neg.
@@ -471,83 +522,64 @@ class WorldStep:
         return points * scale
 
     def compute_gradient_contributions(self, Points, GradientField):
-
-        # Max and Min values for wrapping
-        Max_X = self.LX * (self.NX + 1) / 2
-        Max_Y = self.LY * (self.NY + 1) / 2
-        Max_Z = self.LZ * (self.NZ + 1) / 2
-
-        Min_X = -self.LX * (self.NX + 1) / 2
-        Min_Y = -self.LY * (self.NY + 1) / 2
-        Min_Z = -self.LZ * (self.NZ + 1) / 2
-        # 
-        Points_Copy = cp.copy(Points)
-        Points_Copy[...,0] = cp.minimum(Points_Copy[...,0], Min_X)
-        Points_Copy[...,0] = cp.maximum(Points_Copy[...,0], Max_X)
-        Points_Copy[...,1] = cp.minimum(Points_Copy[...,1], Min_Y)
-        Points_Copy[...,1] = cp.maximum(Points_Copy[...,1], Max_Y)
-        Points_Copy[...,2] = cp.minimum(Points_Copy[...,2], Min_Z)
-        Points_Copy[...,2] = cp.maximum(Points_Copy[...,2], Max_Z)
-
-
         # Get the voxel indices for each point
 
-        ceil_X = cp.mod(cp.ceil((Points_Copy[:,0] / self.LX) + (self.NX - 2) / 2).astype(cp.int32), self.NX)
-        ceil_Y = cp.mod(cp.ceil((Points_Copy[:,1] / self.LY) + (self.NY - 2) / 2).astype(cp.int32), self.NY)
-        ceil_Z = cp.mod(cp.ceil((Points_Copy[:,2] / self.LZ) + (self.NZ - 2) / 2).astype(cp.int32), self.NZ)
+        ceil_X = cp.mod(cp.ceil((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        ceil_Y = cp.mod(cp.ceil((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        ceil_Z = cp.mod(cp.ceil((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
         
-        floor_X = cp.mod(cp.floor((Points_Copy[:,0] / self.LX) + (self.NX - 2) / 2).astype(cp.int32), self.NX)
-        floor_Y = cp.mod(cp.floor((Points_Copy[:,1] / self.LY) + (self.NY - 2) / 2).astype(cp.int32), self.NY)
-        floor_Z = cp.mod(cp.floor((Points_Copy[:,2] / self.LZ) + (self.NZ - 2) / 2).astype(cp.int32), self.NZ)
+        floor_X = cp.mod(cp.floor((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        floor_Y = cp.mod(cp.floor((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        floor_Z = cp.mod(cp.floor((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
 
         # Compute contributions from the 8 surrounding voxels
 
         impulseContributions = cp.zeros_like(Points)
 
-        SelPoints = cp.stack((ceil_X, ceil_Y, ceil_Z), axis=-1)
-        SelGradients = GradientField[ceil_X, ceil_Y, ceil_Z]
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, ceil_Y, ceil_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((ceil_X, ceil_Y, floor_Z), axis=-1)
-        SelGradients = GradientField[ceil_X, ceil_Y, floor_Z]
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, ceil_Y, ceil_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((ceil_X, floor_Y, ceil_Z), axis=-1)
-        SelGradients = GradientField[ceil_X, floor_Y, ceil_Z]
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, floor_Y, ceil_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((ceil_X, floor_Y, floor_Z), axis=-1)
-        SelGradients = GradientField[ceil_X, floor_Y, floor_Z]
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, floor_Y, ceil_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((floor_X, ceil_Y, ceil_Z), axis=-1)
-        SelGradients = GradientField[floor_X, ceil_Y, ceil_Z]
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, ceil_Y, floor_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((floor_X, ceil_Y, floor_Z), axis=-1)
-        SelGradients = GradientField[floor_X, ceil_Y, floor_Z]
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, ceil_Y, floor_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((floor_X, floor_Y, ceil_Z), axis=-1)
-        SelGradients = GradientField[floor_X, floor_Y, ceil_Z]
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, floor_Y, floor_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
         
-        SelPoints = cp.stack((floor_X, floor_Y, floor_Z), axis=-1)
-        SelGradients = GradientField[floor_X, floor_Y, floor_Z]
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, floor_Y, floor_X]
         R_vec = Points - SelPoints
         R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
         impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
@@ -555,8 +587,71 @@ class WorldStep:
             
         return impulseContributions
     
-    def compute_curl_contributions(self, Points, Points_Prev, CurlField):
-        pass
+    def compute_curl_contributions(self, Points, CurlField):
+        # Get the voxel indices for each point
+
+        ceil_X = cp.mod(cp.ceil((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        ceil_Y = cp.mod(cp.ceil((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        ceil_Z = cp.mod(cp.ceil((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+        
+        floor_X = cp.mod(cp.floor((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        floor_Y = cp.mod(cp.floor((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        floor_Z = cp.mod(cp.floor((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+
+        # Compute contributions from the 8 surrounding voxels
+
+        impulseContributions = cp.zeros_like(Points)
+
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+
+            
+        return impulseContributions
 
 
     # -------------------------
@@ -570,11 +665,16 @@ class WorldStep:
         First 50% colored by velocity, second 50% colored cyan.
         """
         n_particles = self.num_particles
+        
+        # Handle empty particle case
+        if n_particles == 0:
+            return cp.empty((0, 8), dtype=cp.float32)
+        
         verts = cp.empty((2 * n_particles, 8), dtype=cp.float32)
 
         # First particle set: positions and velocity-based colors
         verts[0:n_particles, 0:3] = self.particles
-        A = self.particles - self.particles_prev
+        A = self.particles_vel
         mag_A = cp.sqrt(A[..., 0]**2 + A[..., 1]**2 + A[..., 2]**2) + 1e-6
         normA = A / mag_A[:, cp.newaxis]
         verts[0:n_particles, 3] = normA[..., 0] * 0.5 + 0.5

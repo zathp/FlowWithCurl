@@ -32,8 +32,14 @@ def main():
 
         print("Simulation initialized successfully")
         print("Starting viewer...")
+        print("Press 'C' in viewer to export particle force diagnostics CSV")
         run_viewer(sim, width=1920, height=1080)
         save_2d_snapshot(sim, 'my_particles_after_viewer.png', dpi=200)
+        
+        # Export final diagnostics
+        print("\nExporting final particle diagnostics...")
+        sim.export_particle_force_diagnostics('particle_diagnostics_final.csv', num_samples=1000)
+        
         print("Viewer closed")
     except Exception as e:
         print(f"Error occurred: {e}")

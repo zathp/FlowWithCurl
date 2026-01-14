@@ -741,4 +741,161 @@ class WorldStep:
         except Exception as e:
             print("Error computing field stats:", e)
 
+    def export_particle_force_diagnostics(self, csv_path='particle_diagnostics.csv', dt=0.1, num_samples=500):
+        """Export detailed force diagnostics for particles to CSV file.
+        
+        Args:
+            csv_path: Output CSV file path
+            dt: Timestep (same as used in step_particles)
+            num_samples: Number of particles to sample (or 'all' for all particles)
+        """
+        import csv
+        
+        if self.num_particles == 0:
+            print("No particles to diagnose")
+            return
+        
+        # Select sample indices
+        if num_samples == 'all' or num_samples >= self.num_particles:
+            sample_indices = cp.arange(self.num_particles)
+        else:
+            # Sample uniformly across all particles
+            step = max(1, self.num_particles // num_samples)
+            sample_indices = cp.arange(0, self.num_particles, step)
+        
+        # Get sample particles
+        sample_particles = self.particles[sample_indices]
+        sample_particles2 = self.particles2[sample_indices]
+        sample_vel = self.particles_vel[sample_indices]
+        sample_vel2 = self.particles2_vel[sample_indices]
+        
+        # Compute forces (same as step_particles)
+        flow_contrib = self.compute_gradient_contributions(sample_particles, self.flowfield)
+        flow_contrib2 = -self.compute_gradient_contributions(sample_particles2, self.flowfield)
+        
+        curl_contrib = self.compute_curl_contributions(sample_particles, self.curlfield)
+        curl_contrib2 = -self.compute_curl_contributions(sample_particles2, self.curlfield)
+        
+        # Sample field values at particle positions
+        density_at_p1 = self._sample_scalar_field_at_points(sample_particles, self.densityfield)
+        density_at_p2 = self._sample_scalar_field_at_points(sample_particles2, self.densityfield)
+        
+        # Convert to numpy for CSV writing
+        sample_particles_np = cp.asnumpy(sample_particles)
+        sample_particles2_np = cp.asnumpy(sample_particles2)
+        sample_vel_np = cp.asnumpy(sample_vel)
+        sample_vel2_np = cp.asnumpy(sample_vel2)
+        flow_contrib_np = cp.asnumpy(flow_contrib)
+        flow_contrib2_np = cp.asnumpy(flow_contrib2)
+        curl_contrib_np = cp.asnumpy(curl_contrib)
+        curl_contrib2_np = cp.asnumpy(curl_contrib2)
+        density_at_p1_np = cp.asnumpy(density_at_p1)
+        density_at_p2_np = cp.asnumpy(density_at_p2)
+        
+        # Calculate domain bounds for corner detection
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+        corner_threshold = min(self.LX, self.LY, self.LZ) * 3  # Within 3 cells of corner
+        
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow([
+                'particle_set', 'particle_id', 'global_id',
+                'pos_x', 'pos_y', 'pos_z',
+                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
+                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
+                'curl_contrib_x', 'curl_contrib_y', 'curl_contrib_z', 'curl_contrib_mag',
+                'density_at_particle',
+                'dist_to_center', 'near_corner',
+                'normalized_pos_x', 'normalized_pos_y', 'normalized_pos_z'
+            ])
+            
+            # Write particle set 1
+            for i, idx in enumerate(sample_indices.get()):
+                pos = sample_particles_np[i]
+                vel = sample_vel_np[i]
+                flow_f = flow_contrib_np[i]
+                curl_f = curl_contrib_np[i]
+                density = density_at_p1_np[i]
+                
+                vel_mag = cp.linalg.norm(vel)
+                flow_mag = cp.linalg.norm(flow_f)
+                curl_mag = cp.linalg.norm(curl_f)
+                dist_center = cp.linalg.norm(pos)
+                
+                # Check if near corner (all 3 coords near max/min)
+                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
+                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
+                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
+                near_corner = near_x and near_y and near_z
+                
+                # Normalized position [-1, 1] in each dimension
+                norm_x = pos[0] / half_lx
+                norm_y = pos[1] / half_ly
+                norm_z = pos[2] / half_lz
+                
+                writer.writerow([
+                    'set1', i, int(idx),
+                    pos[0], pos[1], pos[2],
+                    vel[0], vel[1], vel[2], vel_mag,
+                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
+                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
+                    density,
+                    dist_center, near_corner,
+                    norm_x, norm_y, norm_z
+                ])
+            
+            # Write particle set 2
+            for i, idx in enumerate(sample_indices.get()):
+                pos = sample_particles2_np[i]
+                vel = sample_vel2_np[i]
+                flow_f = flow_contrib2_np[i]
+                curl_f = curl_contrib2_np[i]
+                density = density_at_p2_np[i]
+                
+                vel_mag = cp.linalg.norm(vel)
+                flow_mag = cp.linalg.norm(flow_f)
+                curl_mag = cp.linalg.norm(curl_f)
+                dist_center = cp.linalg.norm(pos)
+                
+                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
+                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
+                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
+                near_corner = near_x and near_y and near_z
+                
+                norm_x = pos[0] / half_lx
+                norm_y = pos[1] / half_ly
+                norm_z = pos[2] / half_lz
+                
+                writer.writerow([
+                    'set2', i, int(idx),
+                    pos[0], pos[1], pos[2],
+                    vel[0], vel[1], vel[2], vel_mag,
+                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
+                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
+                    density,
+                    dist_center, near_corner,
+                    norm_x, norm_y, norm_z
+                ])
+        
+        print(f"Exported {len(sample_indices) * 2} particle diagnostics to {csv_path}")
+    
+    def _sample_scalar_field_at_points(self, points, field):
+        """Sample scalar field values at particle positions using trilinear interpolation."""
+        # Convert positions to grid indices
+        ix = ((points[:, 0] / self.LX) + self.NX / 2).astype(cp.int32)
+        iy = ((points[:, 1] / self.LY) + self.NY / 2).astype(cp.int32)
+        iz = ((points[:, 2] / self.LZ) + self.NZ / 2).astype(cp.int32)
+        
+        # Wrap indices
+        ix = cp.mod(ix, self.NX)
+        iy = cp.mod(iy, self.NY)
+        iz = cp.mod(iz, self.NZ)
+        
+        # Sample field at nearest grid point (simple nearest-neighbor for diagnostics)
+        return field[iz, iy, ix]
+
 

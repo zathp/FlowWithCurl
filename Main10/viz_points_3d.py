@@ -253,6 +253,19 @@ def run_viewer(sim, width=1000, height=800, print_timings=False):
                     print(f"Dumped to {dump_path}")
                 except Exception as e:
                     print(f"Error dumping: {e}")
+            elif key == glfw.KEY_C:
+                # export particle force diagnostics to CSV
+                try:
+                    import time
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    csv_path = f'particle_diagnostics_{timestamp}.csv'
+                    print(f"Exporting particle diagnostics to {csv_path}...")
+                    sim.export_particle_force_diagnostics(csv_path, num_samples=1000)
+                    print(f"Successfully exported diagnostics!")
+                except Exception as e:
+                    print(f"Error exporting diagnostics: {e}")
+                    import traceback
+                    traceback.print_exc()
             elif key == glfw.KEY_ESCAPE:
                 glfw.set_window_should_close(window, True)
         # clamp camera radius to allowed range

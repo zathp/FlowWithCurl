@@ -48,6 +48,7 @@
 |-----|--------|
 | **P** | Print random particle sample (position and color) |
 | **D** | Dump current simulation state to temp file (.npz) |
+| **C** | Export particle force diagnostics to CSV file |
 
 ## Notes
 - Camera movement speed scales with current zoom level (camera radius)

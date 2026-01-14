@@ -244,6 +244,13 @@ Press **D** in the viewer to save current state to:
 - Temporary `.npz` file with all field data
 - Can be loaded with `plot_vectors.py --load-dump`
 
+### Exporting Particle Force Diagnostics
+
+Press **C** in the viewer to export detailed particle analysis:
+- Creates timestamped CSV: `particle_diagnostics_YYYYMMDD_HHMMSS.csv`
+- On exit, auto-exports: `particle_diagnostics_final.csv`
+- Contains per-particle data: position, velocity, forces, density, corner detection
+
 ### Visualizing Vector Fields
 
 ```bash
@@ -314,6 +321,52 @@ This creates rich, turbulent dynamics!
 
 ---
 
+## Diagnostic Tools
+
+### Particle Force Analysis (CSV Export)
+
+The simulation includes comprehensive force diagnostics to help debug particle behavior:
+
+**Key Command:** Press **C** in viewer or wait for auto-export on exit
+
+**CSV Columns:**
+
+| Column | Description |
+|--------|-------------|
+| `particle_set` | 'set1' (heavy particles) or 'set2' (light particles) |
+| `particle_id` | Index within particle set |
+| `global_id` | Original particle index |
+| `pos_x, pos_y, pos_z` | Particle position in world space |
+| `vel_x, vel_y, vel_z, vel_mag` | Particle velocity components and magnitude |
+| `flow_force_x/y/z, flow_force_mag` | Flow field forces (pressure/gradient) |
+| `curl_contrib_x/y/z, curl_contrib_mag` | Curl field forces (vorticity rotation) |
+| `density_at_particle` | Local density value at particle location |
+| `dist_to_center` | Euclidean distance from domain center |
+| `near_corner` | TRUE if within 3 cells of toroidal corner |
+| `normalized_pos_x/y/z` | Position scaled to [-1, 1] range |
+
+**Use Cases:**
+- Debug corner accumulation: filter `near_corner = True`
+- Analyze force balance: compare `flow_force_mag` vs `curl_contrib_mag`
+- Find density hotspots: sort by `density_at_particle`
+- Identify boundary artifacts: check particles near normalized edges (±1)
+
+**Example Analysis:**
+```python
+import pandas as pd
+df = pd.read_csv('particle_diagnostics_final.csv')
+
+# Find particles near corners
+corner_particles = df[df['near_corner'] == True]
+
+# Compare forces at corners vs center
+print("Corner force avg:", corner_particles['flow_force_mag'].mean())
+center_particles = df[df['dist_to_center'] < 5.0]
+print("Center force avg:", center_particles['flow_force_mag'].mean())
+```
+
+---
+
 ## Summary
 
 Main10 is a sophisticated **curl-noise based fluid simulator** with:
@@ -322,5 +375,6 @@ Main10 is a sophisticated **curl-noise based fluid simulator** with:
 - GPU acceleration via CuPy
 - Interactive 3D visualization
 - Multiple density fields for complex interactions
+- Comprehensive diagnostic tools for debugging
 
 Perfect for visual effects, studying vortex dynamics, or exploring computational fluid dynamics concepts!

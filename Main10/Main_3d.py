@@ -31,10 +31,18 @@ def main():
         save_2d_snapshot(sim, 'my_particles.png', dpi=200)
 
         print("Simulation initialized successfully")
+        
+        # Enable particle trajectory tracking
+        sim.enable_particle_tracking(num_particles_to_track=10)
+        
         print("Starting viewer...")
         print("Press 'C' in viewer to export particle force diagnostics CSV")
         run_viewer(sim, width=1920, height=1080)
         save_2d_snapshot(sim, 'my_particles_after_viewer.png', dpi=200)
+        
+        # Export trajectory data
+        print("\nExporting particle trajectories...")
+        sim.export_particle_trajectories('particle_trajectories.csv')
         
         # Export final diagnostics
         print("\nExporting final particle diagnostics...")

@@ -66,13 +66,15 @@ class WorldStep:
         self.init_kernels()
         # initialize fields to zeros (curl/density); flow is seeded below
         if enable_particles:
+            # FIXED: Add half-cell offset to prevent particles from initializing ON boundaries
+            # Particles at exact boundaries (-5.0) cause phantom forces; offset places them inside domain (-4.95)
             self.particles = self.generate_initial_particles(nx, ny, nz,
-                origin=(-lx * (nx - 1) / 2, -ly * (ny - 1) / 2, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+                origin=(-lx * nx / 2 + lx*0.5, -ly * ny / 2 + ly*0.5, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
                 , step=particle_dispersion)
             self.particles_vel = cp.zeros_like(self.particles)
-            # second particle set (initialized with slight offset)
+            # second particle set (initialized with full-cell offset)
             self.particles2 = self.generate_initial_particles(nx, ny, nz,
-                origin=(-lx * (nx - 1) / 2 + lx*0.5, -ly * (ny - 1) / 2 + ly*0.5, -lz * (nz - 1) / 2), spacing=(lx, ly, lz)
+                origin=(-lx * nx / 2 + lx*1.0, -ly * ny / 2 + ly*1.0, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
                 , step=particle_dispersion)
             self.particles2_vel = cp.zeros_like(self.particles2)
             self.num_particles = self.particles.shape[0]
@@ -95,6 +97,12 @@ class WorldStep:
 
         self.init_densityfield()
         self.init_flowfield(seed=seed, magnitude=2.0)
+        
+        # Particle trajectory tracking
+        self.tracking_enabled = False
+        self.tracked_particle_indices = []
+        self.trajectory_data = []
+        self.step_count = 0
         pass
 
     def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0), step=1):
@@ -188,6 +196,160 @@ class WorldStep:
         # Normalize weights
         self.mean_weights = [w / self.ahat5_weight for w in self.mean_weights]
 
+    def enable_particle_tracking(self, num_particles_to_track=5):
+        """Enable trajectory tracking for a subset of particles.
+        
+        Args:
+            num_particles_to_track: Number of particles to track (evenly distributed)
+        """
+        if self.num_particles == 0:
+            print("No particles to track")
+            return
+        
+        # Select evenly distributed particles
+        step = max(1, self.num_particles // num_particles_to_track)
+        self.tracked_particle_indices = list(range(0, self.num_particles, step))[:num_particles_to_track]
+        self.tracking_enabled = True
+        self.trajectory_data = []
+        self.step_count = 0
+        print(f"Tracking {len(self.tracked_particle_indices)} particles: {self.tracked_particle_indices}")
+    
+    def _record_tracked_particles(self):
+        """Record current state of tracked particles."""
+        if not self.tracking_enabled or len(self.tracked_particle_indices) == 0:
+            return
+        
+        # Compute forces for tracked particles
+        tracked_indices_cp = cp.array(self.tracked_particle_indices, dtype=cp.int32)
+        
+        # Get particle data
+        tracked_pos1 = self.particles[tracked_indices_cp]
+        tracked_pos2 = self.particles2[tracked_indices_cp]
+        tracked_vel1 = self.particles_vel[tracked_indices_cp]
+        tracked_vel2 = self.particles2_vel[tracked_indices_cp]
+        
+        # Compute forces
+        flow_force1 = self.compute_gradient_contributions(tracked_pos1, self.flowfield)
+        flow_force2 = -self.compute_gradient_contributions(tracked_pos2, self.flowfield)
+        curl_force1 = self.compute_curl_contributions(tracked_pos1, self.curlfield)
+        curl_force2 = -self.compute_curl_contributions(tracked_pos2, self.curlfield)
+        
+        # Sample density
+        density1 = self._sample_scalar_field_at_points(tracked_pos1, self.densityfield)
+        density2 = self._sample_scalar_field_at_points(tracked_pos2, self.densityfield)
+        
+        # Convert to numpy
+        tracked_pos1_np = cp.asnumpy(tracked_pos1)
+        tracked_pos2_np = cp.asnumpy(tracked_pos2)
+        tracked_vel1_np = cp.asnumpy(tracked_vel1)
+        tracked_vel2_np = cp.asnumpy(tracked_vel2)
+        flow_force1_np = cp.asnumpy(flow_force1)
+        flow_force2_np = cp.asnumpy(flow_force2)
+        curl_force1_np = cp.asnumpy(curl_force1)
+        curl_force2_np = cp.asnumpy(curl_force2)
+        density1_np = cp.asnumpy(density1)
+        density2_np = cp.asnumpy(density2)
+        
+        # Store data for both particle sets
+        for i, particle_id in enumerate(self.tracked_particle_indices):
+            # Set 1
+            self.trajectory_data.append({
+                'step': self.step_count,
+                'particle_set': 'set1',
+                'particle_id': particle_id,
+                'pos_x': tracked_pos1_np[i, 0],
+                'pos_y': tracked_pos1_np[i, 1],
+                'pos_z': tracked_pos1_np[i, 2],
+                'vel_x': tracked_vel1_np[i, 0],
+                'vel_y': tracked_vel1_np[i, 1],
+                'vel_z': tracked_vel1_np[i, 2],
+                'flow_force_x': flow_force1_np[i, 0],
+                'flow_force_y': flow_force1_np[i, 1],
+                'flow_force_z': flow_force1_np[i, 2],
+                'curl_force_x': curl_force1_np[i, 0],
+                'curl_force_y': curl_force1_np[i, 1],
+                'curl_force_z': curl_force1_np[i, 2],
+                'density': density1_np[i]
+            })
+            
+            # Set 2
+            self.trajectory_data.append({
+                'step': self.step_count,
+                'particle_set': 'set2',
+                'particle_id': particle_id,
+                'pos_x': tracked_pos2_np[i, 0],
+                'pos_y': tracked_pos2_np[i, 1],
+                'pos_z': tracked_pos2_np[i, 2],
+                'vel_x': tracked_vel2_np[i, 0],
+                'vel_y': tracked_vel2_np[i, 1],
+                'vel_z': tracked_vel2_np[i, 2],
+                'flow_force_x': flow_force2_np[i, 0],
+                'flow_force_y': flow_force2_np[i, 1],
+                'flow_force_z': flow_force2_np[i, 2],
+                'curl_force_x': curl_force2_np[i, 0],
+                'curl_force_y': curl_force2_np[i, 1],
+                'curl_force_z': curl_force2_np[i, 2],
+                'density': density2_np[i]
+            })
+    
+    def export_particle_trajectories(self, csv_path='particle_trajectories.csv'):
+        """Export tracked particle trajectories to CSV.
+        
+        Args:
+            csv_path: Output CSV file path
+        """
+        import csv
+        
+        if not self.tracking_enabled or len(self.trajectory_data) == 0:
+            print("No trajectory data to export. Enable tracking with enable_particle_tracking() first.")
+            return
+        
+        with open(csv_path, 'w', newline='') as f:
+            fieldnames = [
+                'step', 'particle_set', 'particle_id',
+                'pos_x', 'pos_y', 'pos_z',
+                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
+                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
+                'curl_force_x', 'curl_force_y', 'curl_force_z', 'curl_force_mag',
+                'density', 'dist_to_center'
+            ]
+            
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for row in self.trajectory_data:
+                # Calculate magnitudes
+                vel_mag = (row['vel_x']**2 + row['vel_y']**2 + row['vel_z']**2)**0.5
+                flow_mag = (row['flow_force_x']**2 + row['flow_force_y']**2 + row['flow_force_z']**2)**0.5
+                curl_mag = (row['curl_force_x']**2 + row['curl_force_y']**2 + row['curl_force_z']**2)**0.5
+                dist = (row['pos_x']**2 + row['pos_y']**2 + row['pos_z']**2)**0.5
+                
+                writer.writerow({
+                    'step': row['step'],
+                    'particle_set': row['particle_set'],
+                    'particle_id': row['particle_id'],
+                    'pos_x': row['pos_x'],
+                    'pos_y': row['pos_y'],
+                    'pos_z': row['pos_z'],
+                    'vel_x': row['vel_x'],
+                    'vel_y': row['vel_y'],
+                    'vel_z': row['vel_z'],
+                    'vel_mag': vel_mag,
+                    'flow_force_x': row['flow_force_x'],
+                    'flow_force_y': row['flow_force_y'],
+                    'flow_force_z': row['flow_force_z'],
+                    'flow_force_mag': flow_mag,
+                    'curl_force_x': row['curl_force_x'],
+                    'curl_force_y': row['curl_force_y'],
+                    'curl_force_z': row['curl_force_z'],
+                    'curl_force_mag': curl_mag,
+                    'density': row['density'],
+                    'dist_to_center': dist
+                })
+        
+        print(f"Exported {len(self.trajectory_data)} trajectory records to {csv_path}")
+        print(f"Tracked {len(self.tracked_particle_indices)} particles across {self.step_count} steps")
+
     def init_densityfield(self):
         # Properly initialize densityfield with random values in [-1,1]
         self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
@@ -260,6 +422,10 @@ class WorldStep:
     def step(self, dt=0.1, print_timings=True):
         timings = {}
         
+        # Track particles at start of step (before forces are applied)
+        if self.tracking_enabled:
+            self._record_tracked_particles()
+        
         t0 = time.perf_counter()
         self.step_densityfield(dt)
         timings['densityfield'] = time.perf_counter() - t0
@@ -298,6 +464,8 @@ class WorldStep:
             print(f"Step timings (ms): total={total*1000:.2f}")
             for name, t in sorted(timings.items(), key=lambda x: -x[1]):
                 print(f"  {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
+        
+        self.step_count += 1
     
     def step_densityfield(self, dt=0.1, diffusion_rate=0.1, curl_divergence_strength=0.0):
         """Advect and diffuse density field.
@@ -317,7 +485,7 @@ class WorldStep:
             # normalize curl magnitude to [0, 1] range for stable effect
             curl_mag_normalized = curl_mag / (cp.max(curl_mag) + 1e-9)
             # divergence contribution: positive curl magnitude = outward spreading
-            self.densityfield += curl_mag * curl_divergence_strength * dt
+            self.densityfield += curl_mag_normalized * curl_divergence_strength * dt
         
         # Clamp to reasonable range
         self.densityfield = cp.clip(self.densityfield, -1.0, 1.0)

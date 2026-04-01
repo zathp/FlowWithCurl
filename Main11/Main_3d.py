@@ -37,7 +37,7 @@ def main():
         
         print("Starting viewer...")
         print("Press 'C' in viewer to export particle force diagnostics CSV")
-        run_viewer(sim, width=1920, height=1080)
+        run_viewer(sim, width=1920, height=1080, sim_ups=1000)
         save_2d_snapshot(sim, 'my_particles_after_viewer.png', dpi=200)
         
         # Export trajectory data

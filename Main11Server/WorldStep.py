@@ -29,8 +29,12 @@ class WorldStep:
             nx=50, ny=50, nz=50,
             lx=4.0, ly=4.0, lz=4.0,
             k1_size=3, k2_size=2, k3_size=3, k4_size=2, k5_size=2,
-            seed=0):
+            seed=0, device_id=None):
         
+        self.device_id = device_id
+        if device_id is not None:
+            cp.cuda.Device(int(device_id)).use()
+
         self.NX = nx
         self.NY = ny
         self.NZ = nz
@@ -887,6 +891,37 @@ class WorldStep:
         # give second set a slightly larger base size
         verts[n_particles:2*n_particles, 6] = min_size * 1.2
         verts[n_particles:2*n_particles, 7] = 1.0  # opaque
+
+        return verts
+
+    def build_point_vertices_region(self, region=None, min_size=3.0, max_size=18.0, stride=1):
+        """Return point vertices optionally filtered to a spatial region.
+
+        region format:
+            {
+                'x': (xmin, xmax),
+                'y': (ymin, ymax),
+                'z': (zmin, zmax),
+            }
+        Any missing axis is left unfiltered.
+        """
+        verts = self.build_point_vertices(min_size=min_size, max_size=max_size)
+        if verts.shape[0] == 0:
+            return verts
+
+        if region:
+            mask = cp.ones((verts.shape[0],), dtype=cp.bool_)
+            for axis_idx, axis_name in enumerate(("x", "y", "z")):
+                bounds = region.get(axis_name) if isinstance(region, dict) else None
+                if bounds is None:
+                    continue
+                lo, hi = float(bounds[0]), float(bounds[1])
+                mask &= (verts[:, axis_idx] >= lo) & (verts[:, axis_idx] <= hi)
+            verts = verts[mask]
+
+        stride = max(1, int(stride))
+        if stride > 1 and verts.shape[0] > 0:
+            verts = verts[::stride]
 
         return verts
 

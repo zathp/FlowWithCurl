@@ -1,0 +1,1093 @@
+import cupy as cp
+import math
+import time
+
+class WorldStep:
+
+
+
+    # k1 in grid kernel for diffusion and curl calculation
+    # k2 out of grid kernel for divergence and gradient calculation
+    # k3 in grid kernel for density field diffusion
+    # k4 in grid kernel for double gradient calculation
+    # k5 in grid kernel for local mean calculation
+
+    def __init__(
+            self,
+            base_eddy=0.7,
+            damping=0.02,
+            dispersion=-0.5,
+            particle_mass1=1.0,
+            particle_mass2=1.0,
+            particle_dispersion=1,
+            enable_particles=True,
+            particle_velocity_max=5.0,
+            density1_injection_strength_pos=0.3,
+            density1_injection_strength_neg=0.3,
+            density2_injection_strength=0.5,
+            density2_follow_strength=0.0,
+            nx=50, ny=50, nz=50,
+            lx=4.0, ly=4.0, lz=4.0,
+            k1_size=3, k2_size=2, k3_size=3, k4_size=2, k5_size=2,
+            seed=0):
+        
+        self.NX = nx
+        self.NY = ny
+        self.NZ = nz
+        self.LX = lx
+        self.LY = ly
+        self.LZ = lz
+        self.seed = seed
+
+        # base magnitude for flow vectors
+        self.base_eddy = float(base_eddy)
+        self.dispersion = dispersion
+        self.particle_mass1 = particle_mass1
+        self.particle_mass2 = particle_mass2
+        self.damping = damping
+        self.enable_particles = enable_particles
+        
+        # Particle behavior parameters
+        self.particle_velocity_max = particle_velocity_max
+        self.density2_follow_strength = density2_follow_strength
+        
+        # Density injection strengths
+        self.density1_injection_strength_pos = density1_injection_strength_pos
+        self.density1_injection_strength_neg = density1_injection_strength_neg
+        self.density2_injection_strength = density2_injection_strength
+
+        #initialize kernel average weights for normalization
+        self.k1_size = k1_size
+        self.k2_size = k2_size
+        self.k3_size = k3_size
+        self.k4_size = k4_size
+        self.k5_size = k5_size
+
+        self.init_kernels()
+        # initialize fields to zeros (curl/density); flow is seeded below
+        if enable_particles:
+            # FIXED: Add half-cell offset to prevent particles from initializing ON boundaries
+            # Particles at exact boundaries (-5.0) cause phantom forces; offset places them inside domain (-4.95)
+            self.particles = self.generate_initial_particles(nx, ny, nz,
+                origin=(-lx * nx / 2 + lx*0.5, -ly * ny / 2 + ly*0.5, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
+                , step=particle_dispersion)
+            self.particles_vel = cp.zeros_like(self.particles)
+            # second particle set (initialized with full-cell offset)
+            self.particles2 = self.generate_initial_particles(nx, ny, nz,
+                origin=(-lx * nx / 2 + lx*1.0, -ly * ny / 2 + ly*1.0, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
+                , step=particle_dispersion)
+            self.particles2_vel = cp.zeros_like(self.particles2)
+            self.num_particles = self.particles.shape[0]
+        else:
+            # Create empty particle arrays
+            self.particles = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles_vel = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles2 = cp.zeros((0, 3), dtype=cp.float32)
+            self.particles2_vel = cp.zeros((0, 3), dtype=cp.float32)
+            self.num_particles = 0
+        # initialize fields to zeros to avoid uninitialized memory
+        self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.curlfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.flowfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.flowfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        self.densityfield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+        self.densityfield2 = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+
+        self.num_particles = self.particles.shape[0]
+
+        self.init_densityfield()
+        self.init_flowfield(seed=seed, magnitude=2.0)
+        
+        # Particle trajectory tracking
+        self.tracking_enabled = False
+        self.tracked_particle_indices = []
+        self.trajectory_data = []
+        self.step_count = 0
+        pass
+
+    def generate_initial_particles(self, nx, ny, nz, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0), step=1):
+        ox, oy, oz = origin
+        dx, dy, dz = spacing
+
+        x = ox + dx * cp.arange(nx, step=step)
+        y = oy + dy * cp.arange(ny, step=step)
+        z = oz + dz * cp.arange(nz, step=step)
+
+        X, Y, Z = cp.meshgrid(x, y, z, indexing="ij")
+        field = cp.stack((X, Y, Z), axis=-1)   # (nx, ny, nz, 3)
+        num_points = field.shape[0] * field.shape[1] * field.shape[2]
+        return field.reshape((num_points, 3)).astype(cp.float32)
+
+    def init_kernels(self):
+        # Precompute diffusion kernel weights (k1_size)
+        self.diffuse_weights = []
+        self.diffuse_shifts = []
+        self.ahat1_weight = 0.0
+        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
+            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
+                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2)+1):
+                    r = math.sqrt(i*i + j*j + k*k)
+                    weight = math.exp(self.dispersion * r)
+                    self.ahat1_weight += weight
+                    self.diffuse_weights.append(weight)
+                    self.diffuse_shifts.append((i, j, k))
+        # Normalize weights
+        self.diffuse_weights = [w / self.ahat1_weight for w in self.diffuse_weights]
+        
+        # Precompute curl kernel data (reuses k1_size, same as diffuse)
+        self.curl_weights = []
+        self.curl_shifts = []
+        self.curl_rvecs = []
+        for i in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+            for j in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+                for k in range(-round((self.k1_size-1)/2), round((self.k1_size-1)/2) + 1):
+                    r = math.sqrt(i*i + j*j + k*k)
+                    weight = math.exp(self.dispersion * r) / self.ahat1_weight
+                    self.curl_weights.append(weight)
+                    self.curl_shifts.append((i, j, k))
+                    self.curl_rvecs.append(cp.array([i, j, k], dtype=cp.float32))
+
+        # Precompute gradient kernel data (k2_size)
+        self.gradient_weights = []
+        self.gradient_shifts = []
+        self.gradient_offsets = []
+        self.ahat2_weight = 0.0
+        for i in range(-self.k2_size, self.k2_size):
+            for j in range(-self.k2_size, self.k2_size):
+                for k in range(-self.k2_size, self.k2_size):
+                    r = math.sqrt((i+0.5)*(i+0.5) + (j+0.5)*(j+0.5) + (k+0.5)*(k+0.5))
+                    weight = r/(1 + r*r)
+                    self.ahat2_weight += weight
+                    self.gradient_weights.append(weight)
+                    self.gradient_shifts.append((i, j, k))
+                    self.gradient_offsets.append((i+0.5, j+0.5, k+0.5))
+        # Normalize gradient weights
+        self.gradient_weights = [w / self.ahat2_weight for w in self.gradient_weights]
+        
+        # Precompute divergence kernel data (k2_size with different range)
+        self.divergence_weights = []
+        self.divergence_shifts = []
+        self.divergence_offsets = []
+        for i in range(-self.k2_size + 1, self.k2_size + 1):
+            for j in range(-self.k2_size + 1, self.k2_size + 1):
+                for k in range(-self.k2_size + 1, self.k2_size + 1):
+                    r = math.sqrt((i - 0.5)*(i - 0.5) + (j - 0.5)*(j - 0.5) + (k - 0.5)*(k - 0.5))
+                    weight = r/(1 + r*r) / self.ahat2_weight
+                    self.divergence_weights.append(weight)
+                    self.divergence_shifts.append((i, j, k))
+                    self.divergence_offsets.append((i - 0.5, j - 0.5, k - 0.5))
+
+        self.ahat3_weight = 0.0
+
+        self.ahat4_weight = 0.0
+
+        # Precompute fieldmean kernel weights (k5_size)
+        self.mean_weights = []
+        self.mean_shifts = []
+        self.ahat5_weight = 0.0
+        for i in range(-self.k5_size, self.k5_size + 1):
+            for j in range(-self.k5_size, self.k5_size + 1):
+                for k in range(-self.k5_size, self.k5_size + 1):
+                    r = math.sqrt(i*i + j*j + k*k)
+                    weight = 1/(1 + r*r)
+                    self.ahat5_weight += weight
+                    self.mean_weights.append(weight)
+                    self.mean_shifts.append((i, j, k))
+        # Normalize weights
+        self.mean_weights = [w / self.ahat5_weight for w in self.mean_weights]
+
+    def enable_particle_tracking(self, num_particles_to_track=5):
+        """Enable trajectory tracking for a subset of particles.
+        
+        Args:
+            num_particles_to_track: Number of particles to track (evenly distributed)
+        """
+        if self.num_particles == 0:
+            print("No particles to track")
+            return
+        
+        # Select evenly distributed particles
+        step = max(1, self.num_particles // num_particles_to_track)
+        self.tracked_particle_indices = list(range(0, self.num_particles, step))[:num_particles_to_track]
+        self.tracking_enabled = True
+        self.trajectory_data = []
+        self.step_count = 0
+        print(f"Tracking {len(self.tracked_particle_indices)} particles: {self.tracked_particle_indices}")
+    
+    def _record_tracked_particles(self):
+        """Record current state of tracked particles."""
+        if not self.tracking_enabled or len(self.tracked_particle_indices) == 0:
+            return
+        
+        # Compute forces for tracked particles
+        tracked_indices_cp = cp.array(self.tracked_particle_indices, dtype=cp.int32)
+        
+        # Get particle data
+        tracked_pos1 = self.particles[tracked_indices_cp]
+        tracked_pos2 = self.particles2[tracked_indices_cp]
+        tracked_vel1 = self.particles_vel[tracked_indices_cp]
+        tracked_vel2 = self.particles2_vel[tracked_indices_cp]
+        
+        # Compute forces
+        flow_force1 = self.compute_gradient_contributions(tracked_pos1, self.flowfield)
+        flow_force2 = -self.compute_gradient_contributions(tracked_pos2, self.flowfield)
+        curl_force1 = self.compute_curl_contributions(tracked_pos1, self.curlfield)
+        curl_force2 = -self.compute_curl_contributions(tracked_pos2, self.curlfield)
+        
+        # Sample density
+        density1 = self._sample_scalar_field_at_points(tracked_pos1, self.densityfield)
+        density2 = self._sample_scalar_field_at_points(tracked_pos2, self.densityfield)
+        
+        # Convert to numpy
+        tracked_pos1_np = cp.asnumpy(tracked_pos1)
+        tracked_pos2_np = cp.asnumpy(tracked_pos2)
+        tracked_vel1_np = cp.asnumpy(tracked_vel1)
+        tracked_vel2_np = cp.asnumpy(tracked_vel2)
+        flow_force1_np = cp.asnumpy(flow_force1)
+        flow_force2_np = cp.asnumpy(flow_force2)
+        curl_force1_np = cp.asnumpy(curl_force1)
+        curl_force2_np = cp.asnumpy(curl_force2)
+        density1_np = cp.asnumpy(density1)
+        density2_np = cp.asnumpy(density2)
+        
+        # Store data for both particle sets
+        for i, particle_id in enumerate(self.tracked_particle_indices):
+            # Set 1
+            self.trajectory_data.append({
+                'step': self.step_count,
+                'particle_set': 'set1',
+                'particle_id': particle_id,
+                'pos_x': tracked_pos1_np[i, 0],
+                'pos_y': tracked_pos1_np[i, 1],
+                'pos_z': tracked_pos1_np[i, 2],
+                'vel_x': tracked_vel1_np[i, 0],
+                'vel_y': tracked_vel1_np[i, 1],
+                'vel_z': tracked_vel1_np[i, 2],
+                'flow_force_x': flow_force1_np[i, 0],
+                'flow_force_y': flow_force1_np[i, 1],
+                'flow_force_z': flow_force1_np[i, 2],
+                'curl_force_x': curl_force1_np[i, 0],
+                'curl_force_y': curl_force1_np[i, 1],
+                'curl_force_z': curl_force1_np[i, 2],
+                'density': density1_np[i]
+            })
+            
+            # Set 2
+            self.trajectory_data.append({
+                'step': self.step_count,
+                'particle_set': 'set2',
+                'particle_id': particle_id,
+                'pos_x': tracked_pos2_np[i, 0],
+                'pos_y': tracked_pos2_np[i, 1],
+                'pos_z': tracked_pos2_np[i, 2],
+                'vel_x': tracked_vel2_np[i, 0],
+                'vel_y': tracked_vel2_np[i, 1],
+                'vel_z': tracked_vel2_np[i, 2],
+                'flow_force_x': flow_force2_np[i, 0],
+                'flow_force_y': flow_force2_np[i, 1],
+                'flow_force_z': flow_force2_np[i, 2],
+                'curl_force_x': curl_force2_np[i, 0],
+                'curl_force_y': curl_force2_np[i, 1],
+                'curl_force_z': curl_force2_np[i, 2],
+                'density': density2_np[i]
+            })
+    
+    def export_particle_trajectories(self, csv_path='particle_trajectories.csv'):
+        """Export tracked particle trajectories to CSV.
+        
+        Args:
+            csv_path: Output CSV file path
+        """
+        import csv
+        
+        if not self.tracking_enabled or len(self.trajectory_data) == 0:
+            print("No trajectory data to export. Enable tracking with enable_particle_tracking() first.")
+            return
+        
+        with open(csv_path, 'w', newline='') as f:
+            fieldnames = [
+                'step', 'particle_set', 'particle_id',
+                'pos_x', 'pos_y', 'pos_z',
+                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
+                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
+                'curl_force_x', 'curl_force_y', 'curl_force_z', 'curl_force_mag',
+                'density', 'dist_to_center'
+            ]
+            
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for row in self.trajectory_data:
+                # Calculate magnitudes
+                vel_mag = (row['vel_x']**2 + row['vel_y']**2 + row['vel_z']**2)**0.5
+                flow_mag = (row['flow_force_x']**2 + row['flow_force_y']**2 + row['flow_force_z']**2)**0.5
+                curl_mag = (row['curl_force_x']**2 + row['curl_force_y']**2 + row['curl_force_z']**2)**0.5
+                dist = (row['pos_x']**2 + row['pos_y']**2 + row['pos_z']**2)**0.5
+                
+                writer.writerow({
+                    'step': row['step'],
+                    'particle_set': row['particle_set'],
+                    'particle_id': row['particle_id'],
+                    'pos_x': row['pos_x'],
+                    'pos_y': row['pos_y'],
+                    'pos_z': row['pos_z'],
+                    'vel_x': row['vel_x'],
+                    'vel_y': row['vel_y'],
+                    'vel_z': row['vel_z'],
+                    'vel_mag': vel_mag,
+                    'flow_force_x': row['flow_force_x'],
+                    'flow_force_y': row['flow_force_y'],
+                    'flow_force_z': row['flow_force_z'],
+                    'flow_force_mag': flow_mag,
+                    'curl_force_x': row['curl_force_x'],
+                    'curl_force_y': row['curl_force_y'],
+                    'curl_force_z': row['curl_force_z'],
+                    'curl_force_mag': curl_mag,
+                    'density': row['density'],
+                    'dist_to_center': dist
+                })
+        
+        print(f"Exported {len(self.trajectory_data)} trajectory records to {csv_path}")
+        print(f"Tracked {len(self.tracked_particle_indices)} particles across {self.step_count} steps")
+
+    def init_densityfield(self):
+        # Properly initialize densityfield with random values in [-1,1]
+        self.densityfield = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
+        # Initialize densityfield2 the same way
+        self.densityfield2 = cp.random.uniform(low=-1.0, high=1.0, size=(self.NZ, self.NY, self.NX)).astype(cp.float32)
+        return self.densityfield
+
+    def init_flowfield(self, seed=None, magnitude=None):
+        """Initialize `self.flowfield` as random directions with uniform magnitude.
+
+        - `seed`: optional RNG seed (defaults to self.seed)
+        - `magnitude`: if provided overrides `self.base_eddy`
+        """
+        if seed is None:
+            seed = int(getattr(self, "seed", 0))
+        mag = float(magnitude) if magnitude is not None else float(self.base_eddy)
+
+        rng = cp.random.RandomState(seed)
+        shape = (self.NZ, self.NY, self.NX, 3)
+        # Draw normal components, normalize to unit vectors, then scale
+        vecs = rng.normal(loc=0.0, scale=1.0, size=shape).astype(cp.float32)
+        norms = cp.linalg.norm(vecs, axis=-1, keepdims=True)
+        norms = cp.where(norms == 0, 1e-9, norms)
+        dirs = vecs / norms
+        self.flowfield = dirs * mag
+        return self.flowfield
+    
+    def calculate_gradientfield_kernal(self, field):
+        gradientfield = cp.zeros_like(field)
+        gradientfield = cp.stack((gradientfield, gradientfield, gradientfield), axis=-1)
+        for weight, shift, offset in zip(self.gradient_weights, self.gradient_shifts, self.gradient_offsets):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            gradientfield[..., 0] += weight * shifted * offset[0]
+            gradientfield[..., 1] += weight * shifted * offset[1]
+            gradientfield[..., 2] += weight * shifted * offset[2]
+        return gradientfield
+    
+    def calculate_divergence_from_flow_kernal(self, field):
+        divergencefield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
+        for weight, shift, offset in zip(self.divergence_weights, self.divergence_shifts, self.divergence_offsets):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            divergencefield += weight * (shifted[...,0] * offset[0] + shifted[...,1] * offset[1] + shifted[...,2] * offset[2])
+        return divergencefield
+    
+    def calculate_curlfield_kernal(self, field):
+        curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
+        for weight, shift, r_vec in zip(self.curl_weights, self.curl_shifts, self.curl_rvecs):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            curlfield += weight * cp.cross(r_vec, shifted)
+        return curlfield
+    
+
+    def diffuse_field_kernal(self, field):
+        diffused_field = cp.zeros_like(field)
+        for weight, shift in zip(self.diffuse_weights, self.diffuse_shifts):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            diffused_field += weight * shifted
+        return diffused_field
+    
+    def fieldmean(self, field):
+        mean_fields = cp.zeros_like(field)
+        for weight, shift in zip(self.mean_weights, self.mean_shifts):
+            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            mean_fields += weight * shifted
+        return mean_fields
+
+    # -------------------------
+    # Simulation step functions
+
+    def step(self, dt=0.1, print_timings=True):
+        timings = {}
+        
+        # Track particles at start of step (before forces are applied)
+        if self.tracking_enabled:
+            self._record_tracked_particles()
+        
+        t0 = time.perf_counter()
+        self.step_densityfield(dt)
+        timings['densityfield'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        self.step_densityfield2(dt)
+        timings['densityfield2'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        gradientfield = self.calculate_gradientfield_kernal(self.densityfield)
+        timings['gradient'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        self.step_flowfield(dt)
+        timings['flowfield'] = time.perf_counter() - t0
+        
+        t0 = time.perf_counter()
+        self.step_curlfield(dt, print_timings=print_timings)
+        timings['curlfield'] = time.perf_counter() - t0
+        
+        if self.enable_particles:
+            t0 = time.perf_counter()
+            self.step_particles(dt)
+            timings['particles'] = time.perf_counter() - t0
+            
+            t0 = time.perf_counter()
+            self.inject_particles_to_density1(strength_pos=self.density1_injection_strength_pos, strength_neg=self.density1_injection_strength_neg)
+            timings['inject_density1'] = time.perf_counter() - t0
+            
+            t0 = time.perf_counter()
+            self.inject_particles_to_density2(strength=self.density2_injection_strength)
+            timings['inject_density2'] = time.perf_counter() - t0
+        
+        if print_timings:
+            total = sum(timings.values())
+            print(f"Step timings (ms): total={total*1000:.2f}")
+            for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+                print(f"  {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
+        
+        self.step_count += 1
+    
+    def step_densityfield(self, dt=0.1, diffusion_rate=0.1, curl_divergence_strength=0.0):
+        """Advect and diffuse density field.
+        
+        curl_divergence_strength: how strongly curl magnitude drives density divergence (0 to disable).
+        """
+        # Diffuse density
+        density_diffused = self.diffuse_field_kernal(self.densityfield)
+        self.densityfield = (1 - diffusion_rate) * self.densityfield + diffusion_rate * density_diffused
+        
+        # Advect density using flow field divergence
+        self.densityfield += self.calculate_divergence_from_flow_kernal(self.flowfield) * dt
+        
+        # Add divergence based on curl magnitude: high vorticity pushes density outward
+        if curl_divergence_strength > 0:
+            curl_mag = cp.linalg.norm(self.curlfield, axis=-1)  # shape (NZ, NY, NX)
+            # normalize curl magnitude to [0, 1] range for stable effect
+            curl_mag_normalized = curl_mag / (cp.max(curl_mag) + 1e-9)
+            # divergence contribution: positive curl magnitude = outward spreading
+            self.densityfield += curl_mag_normalized * curl_divergence_strength * dt
+        
+        # Clamp to reasonable range
+        self.densityfield = cp.clip(self.densityfield, -1.0, 1.0)
+
+    def step_densityfield2(self, dt=0.1, diffusion_rate=0.1, decay_rate=0.998, injection_strength=0.5):
+        """Diffuse second density field with exponential decay (no flow, no curl, pure diffusion).
+        
+        decay_rate: multiplicative decay per frame (0.98 = 2% loss per step)
+        """
+        # Diffuse density
+        density_diffused = self.diffuse_field_kernal(self.densityfield2)
+        self.densityfield2 = (1 - diffusion_rate) * self.densityfield2 + diffusion_rate * density_diffused
+        
+        # Inject from energy of field 1 (optional, can be disabled by setting strength to 0)
+        if injection_strength > 0:
+            flow0 = cp.roll(self.flowfield, shift=1, axis=0)
+            flow1 = cp.roll(self.flowfield, shift=1, axis=1)
+            flow2 = cp.roll(self.flowfield, shift=1, axis=2)
+            flow01 = cp.roll(flow0, shift=1, axis=1)
+            flow02 = cp.roll(flow0, shift=1, axis=2)
+            flow12 = cp.roll(flow1, shift=1, axis=2)
+            flow012 = cp.roll(flow01, shift=1, axis=2)
+            flowavg = self.flowfield + flow0 + flow1 + flow2 + flow01 + flow02 + flow12 + flow012
+            flowavg /= 8 # account for average in gradient kernel
+            energy = self.densityfield * self.densityfield + cp.linalg.norm(flowavg, axis=-1)**2
+            self.densityfield2 += energy * injection_strength * dt
+
+        # Apply exponential decay
+        self.densityfield2 *= decay_rate
+        
+        # Clamp to reasonable range
+        self.densityfield2 = cp.clip(self.densityfield2, -1.0, 1.0)
+
+    def step_flowfield(self, dt=0.1, flow_diffusion_rate=0.05):
+        """Update flow field using density gradients and eddy effects."""
+        # Pressure gradient from density
+        functionfield0 = cp.roll(self.densityfield2, shift=1, axis=0)
+        functionfield1 = cp.roll(self.densityfield2, shift=1, axis=1)
+        functionfield2 = cp.roll(self.densityfield2, shift=1, axis=2)
+        functionfield01 = cp.roll(functionfield0, shift=1, axis=1)
+        functionfield02 = cp.roll(functionfield0, shift=1, axis=2)
+        functionfield12 = cp.roll(functionfield1, shift=1, axis=2)
+        functionfield012 = cp.roll(functionfield01, shift=1, axis=2)
+        functionfield = self.densityfield2 + functionfield0 + functionfield1 + functionfield2 + functionfield01 + functionfield02 + functionfield12 + functionfield012
+        functionfield /= 8.0  # average of center and neighbors
+        functionfield = cp.stack([functionfield, functionfield, functionfield], axis=-1)  # make 3-channel for gradient calculation
+        self.flowfield += self.calculate_gradientfield_kernal(self.densityfield) / (functionfield*functionfield + 1) * dt
+        
+        # Eddy/curl contribution from vorticity
+        curl_change = self.curlfield - self.curlfield_prev
+        eddyflowfield = self.calculate_curlfield_kernal(curl_change)
+        self.flowfield += eddyflowfield * dt * -0.5  # Scale down eddy effect
+        
+        # Apply dispersion (diffusion) to smooth flow field
+        flow_diffused = self.diffuse_field_kernal(self.flowfield)
+        self.flowfield = (1 - flow_diffusion_rate) * self.flowfield + flow_diffusion_rate * flow_diffused
+        
+        # Damping
+        self.flowfield *= (1.0 - self.damping)
+
+    def step_curlfield(self, dt=0.1, curl_diffusion_rate=0.1, print_timings=False):
+        """Update curl field from flow field with diffusion."""
+        if print_timings:
+            timings = {}
+            t0 = time.perf_counter()
+        
+        self.curlfield_prev = cp.copy(self.curlfield)
+        
+        if print_timings:
+            timings['copy'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        # Compute curl of the current flow field
+        self.curlfield = self.calculate_curlfield_kernal(self.flowfield)
+        
+        if print_timings:
+            timings['calculate_curl'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        #calculate diffusion rate based on weighted average of the local density field density
+        density_avg = self.fieldmean(self.densityfield)
+        
+        if print_timings:
+            timings['fieldmean'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        curl_diffusion_rate = curl_diffusion_rate * (2 / (1 + density_avg * density_avg) - 1) # diffusion rate lowers and becomes negative in high density areas
+        curl_diffusion_rate = cp.stack((curl_diffusion_rate, curl_diffusion_rate, curl_diffusion_rate), axis=-1)
+        
+        if print_timings:
+            timings['diffusion_rate_calc'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        # Apply diffusion to smooth out vorticity
+        curl_diffused = self.diffuse_field_kernal(self.curlfield)
+        
+        if print_timings:
+            timings['diffuse'] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+        
+        self.curlfield = (1 - curl_diffusion_rate) * self.curlfield + curl_diffusion_rate * curl_diffused
+        
+        if print_timings:
+            timings['blend'] = time.perf_counter() - t0
+            # Print breakdown
+            total = sum(timings.values())
+            print(f"  Curlfield breakdown (total={total*1000:.2f}ms):")
+            for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+                print(f"    {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
+
+    def step_particles(self, dt=0.1, density2_follow_strength=None):
+        """Advect both particle sets using flow field and densityfield2 gradient.
+        
+        density2_follow_strength: how strongly particles follow densityfield2 gradient (None uses class default)
+        """
+        if density2_follow_strength is None:
+            density2_follow_strength = self.density2_follow_strength
+        # Track previous positions for both sets
+        self.particles_vel = cp.copy(self.particles)
+        self.particles2_vel = cp.copy(self.particles2)
+        
+        # Get impulse from gradient field (flow field influences particle motion)
+        flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
+        flow_contrib2 = -self.compute_gradient_contributions(self.particles2, self.flowfield)
+        
+        # Get gradient contribution from densityfield2 (particles follow density uphill)
+        if density2_follow_strength > 0:
+            density2_grad = self.calculate_gradientfield_kernal(self.densityfield2)
+            density2_contrib = self.compute_gradient_contributions(self.particles, density2_grad)
+            density2_contrib2 = self.compute_gradient_contributions(self.particles2, density2_grad)
+            flow_contrib += density2_contrib * density2_follow_strength
+            flow_contrib2 += density2_contrib2 * density2_follow_strength
+        
+        # Update velocity and position for both sets
+        self.particles_vel += flow_contrib * (dt / self.particle_mass1)
+        self.particles2_vel += flow_contrib2 * (dt / self.particle_mass2)
+
+        curl_contrib = self.compute_curl_contributions(self.particles, self.curlfield)
+        curl_contrib2 = -self.compute_curl_contributions(self.particles2, self.curlfield)
+
+        curl_strength1 = cp.sqrt(cp.sum(curl_contrib * curl_contrib, axis=1)) / self.particle_mass1
+        curl_strength2 = cp.sqrt(cp.sum(curl_contrib2 * curl_contrib2, axis=1)) / self.particle_mass2
+
+        curl_strength1 = cp.stack([curl_strength1, curl_strength1, curl_strength1], axis=1)
+        curl_strength2 = cp.stack([curl_strength2, curl_strength2, curl_strength2], axis=1)
+
+        particles_vel_curl = cp.cross(self.particles_vel, curl_contrib) / (curl_strength1 * self.particle_mass1 + 1e-9)
+        particles2_vel_curl = cp.cross(self.particles2_vel, curl_contrib2) / (curl_strength2 * self.particle_mass2 + 1e-9)
+
+        self.particles_vel = self.particles_vel * cp.cos(curl_strength1 * dt) + particles_vel_curl * cp.sin(curl_strength1 * dt)
+        self.particles2_vel = self.particles2_vel * cp.cos(curl_strength2 * dt) + particles2_vel_curl * cp.sin(curl_strength2 * dt)
+
+        self.particles_vel = WorldStep.clamp_magnitude_gpu(self.particles_vel, max_len=self.particle_velocity_max)
+        self.particles2_vel = WorldStep.clamp_magnitude_gpu(self.particles2_vel, max_len=self.particle_velocity_max)
+        
+        # Update positions
+
+        self.particles += self.particles_vel * dt
+        self.particles2 += self.particles2_vel * dt
+        
+        # Apply toroidal wrapping/boundary conditions
+        # Domain bounds: [-L*NX/2, L*NX/2] in each dimension
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+        
+        # Wrap particles that go out of bounds (periodic boundary conditions)
+        self.particles[..., 0] = cp.mod(self.particles[..., 0] + half_lx, self.LX * self.NX) - half_lx
+        self.particles[..., 1] = cp.mod(self.particles[..., 1] + half_ly, self.LY * self.NY) - half_ly
+        self.particles[..., 2] = cp.mod(self.particles[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
+        
+        self.particles2[..., 0] = cp.mod(self.particles2[..., 0] + half_lx, self.LX * self.NX) - half_lx
+        self.particles2[..., 1] = cp.mod(self.particles2[..., 1] + half_ly, self.LY * self.NY) - half_ly
+        self.particles2[..., 2] = cp.mod(self.particles2[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
+
+    def inject_particles_to_density2(self, strength=0.1):
+        """Inject particle density into densityfield2 at particle locations.
+        
+        strength: how much density each particle contributes (0 to 1 range)
+        """
+        # Map particle positions to grid indices
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+        
+        # Convert positions to normalized indices [0, N)
+        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        
+        # Add density contribution from particles
+        cp.add.at(self.densityfield2, (iz, iy, ix), strength)
+        
+        # Also inject particles2 (opposite set)
+        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        
+        cp.add.at(self.densityfield2, (iz2, iy2, ix2), strength)
+
+    def inject_particles_to_density1(self, strength_pos=-.10, strength_neg=-.10):
+        """Inject particles into densityfield with opposite signs by type.
+
+        particles  (set1) add +strength_pos; particles2 add -strength_neg.
+        """
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+
+        # set1 indices
+        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        cp.add.at(self.densityfield, (iz, iy, ix), strength_pos)
+
+        # set2 indices
+        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
+        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
+        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
+        cp.add.at(self.densityfield, (iz2, iy2, ix2), -strength_neg)
+
+
+    def clamp_magnitude_gpu(points, max_len):
+        mag = cp.linalg.norm(points, axis=1, keepdims=True)
+        scale = cp.minimum(1.0, max_len / (mag + 1e-9))
+        return points * scale
+
+    def compute_gradient_contributions(self, Points, GradientField):
+        # Get the voxel indices for each point
+
+        ceil_X = cp.mod(cp.ceil((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        ceil_Y = cp.mod(cp.ceil((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        ceil_Z = cp.mod(cp.ceil((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+        
+        floor_X = cp.mod(cp.floor((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        floor_Y = cp.mod(cp.floor((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        floor_Z = cp.mod(cp.floor((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+
+        # Compute contributions from the 8 surrounding voxels
+
+        impulseContributions = cp.zeros_like(Points)
+
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[ceil_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelGradients = GradientField[floor_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelGradients, cp.stack((R_factor, R_factor, R_factor), 1))
+
+            
+        return impulseContributions
+    
+    def compute_curl_contributions(self, Points, CurlField):
+        # Get the voxel indices for each point
+
+        ceil_X = cp.mod(cp.ceil((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        ceil_Y = cp.mod(cp.ceil((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        ceil_Z = cp.mod(cp.ceil((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+        
+        floor_X = cp.mod(cp.floor((Points[:,0] / self.LX) + self.NX / 2).astype(cp.int32), self.NX)
+        floor_Y = cp.mod(cp.floor((Points[:,1] / self.LY) + self.NY / 2).astype(cp.int32), self.NY)
+        floor_Z = cp.mod(cp.floor((Points[:,2] / self.LZ) + self.NZ / 2).astype(cp.int32), self.NZ)
+
+        # Compute contributions from the 8 surrounding voxels
+
+        impulseContributions = cp.zeros_like(Points)
+
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, ceil_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((ceil_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, floor_Y, ceil_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (ceil_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, ceil_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (ceil_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[ceil_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+        
+        SelPoints = cp.stack(((floor_X - self.NX / 2) * self.LX, (floor_Y - self.NY / 2) * self.LY, (floor_Z - self.NZ / 2) * self.LZ), axis=-1)
+        SelCurls = CurlField[floor_Z, floor_Y, floor_X]
+        R_vec = Points - SelPoints
+        R_factor = 1 + (R_vec[...,0] * R_vec[...,0] + R_vec[...,1] * R_vec[...,1] + R_vec[...,2] * R_vec[...,2])
+        impulseContributions += cp.divide(SelCurls, cp.stack((R_factor, R_factor, R_factor), 1))
+
+            
+        return impulseContributions
+
+
+    # -------------------------
+    # Vertex generation for rendering
+    # -------------------------
+    def build_point_vertices(self, min_size=3.0, max_size=18.0):
+        """
+        Returns a CuPy array of shape (2*num_particles, 8):
+          [x, y, z, r, g, b, size, alpha]
+        for point cloud visualization with two particle sets.
+        First 50% colored by velocity, second 50% colored cyan.
+        """
+        n_particles = self.num_particles
+        
+        # Handle empty particle case
+        if n_particles == 0:
+            return cp.empty((0, 8), dtype=cp.float32)
+        
+        verts = cp.empty((2 * n_particles, 8), dtype=cp.float32)
+
+        # First particle set: positions and velocity-based colors
+        verts[0:n_particles, 0:3] = self.particles
+        A = self.particles_vel
+        mag_A = cp.sqrt(A[..., 0]**2 + A[..., 1]**2 + A[..., 2]**2) + 1e-6
+        normA = A / mag_A[:, cp.newaxis]
+        verts[0:n_particles, 3] = normA[..., 0] * 0.5 + 0.5
+        verts[0:n_particles, 4] = normA[..., 1] * 0.5 + 0.5
+        verts[0:n_particles, 5] = normA[..., 2] * 0.5 + 0.5
+        # size scaled by speed magnitude
+        speed = mag_A
+        speed_norm = speed / (cp.max(speed) + 1e-6)
+        size = min_size + (max_size - min_size) * speed_norm
+        verts[0:n_particles, 6] = size
+        verts[0:n_particles, 7] = 1.0  # opaque
+
+        # Second particle set: positions and fixed cyan color
+        verts[n_particles:2*n_particles, 0:3] = self.particles2
+        verts[n_particles:2*n_particles, 3] = 0.2  # cyan: low red
+        verts[n_particles:2*n_particles, 4] = 0.9  # cyan: high green
+        verts[n_particles:2*n_particles, 5] = 0.9  # cyan: high blue
+        # give second set a slightly larger base size
+        verts[n_particles:2*n_particles, 6] = min_size * 1.2
+        verts[n_particles:2*n_particles, 7] = 1.0  # opaque
+
+        return verts
+
+    # -------------------------
+    # Diagnostics / helpers
+    # -------------------------
+    def get_field_stats(self, field: str):
+        """Return simple stats (min,max,mean) for a named field.
+
+        field: 'density' | 'flow' | 'curl'
+        For 'flow' and 'curl' we report statistics on magnitude.
+        """
+        if field == "density":
+            arr = self.densityfield
+            vmin = float(cp.min(arr))
+            vmax = float(cp.max(arr))
+            vmean = float(cp.mean(arr))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        elif field == "flow":
+            mag = cp.linalg.norm(self.flowfield, axis=-1)
+            vmin = float(cp.min(mag))
+            vmax = float(cp.max(mag))
+            vmean = float(cp.mean(mag))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        elif field == "curl":
+            mag = cp.linalg.norm(self.curlfield, axis=-1)
+            vmin = float(cp.min(mag))
+            vmax = float(cp.max(mag))
+            vmean = float(cp.mean(mag))
+            return {"min": vmin, "max": vmax, "mean": vmean}
+        else:
+            raise ValueError("Unknown field: %s" % field)
+
+    def print_field_stats(self):
+        """Print diagnostics for density, flow, and curl to console (CuPy -> host floats)."""
+        try:
+            d = self.get_field_stats("density")
+            f = self.get_field_stats("flow")
+            c = self.get_field_stats("curl")
+            print("Field stats:")
+            print(f"  density: min={d['min']:.6g} max={d['max']:.6g} mean={d['mean']:.6g}")
+            print(f"  flow mag: min={f['min']:.6g} max={f['max']:.6g} mean={f['mean']:.6g}")
+            print(f"  curl mag: min={c['min']:.6g} max={c['max']:.6g} mean={c['mean']:.6g}")
+        except Exception as e:
+            print("Error computing field stats:", e)
+
+    def export_particle_force_diagnostics(self, csv_path='particle_diagnostics.csv', dt=0.1, num_samples=500):
+        """Export detailed force diagnostics for particles to CSV file.
+        
+        Args:
+            csv_path: Output CSV file path
+            dt: Timestep (same as used in step_particles)
+            num_samples: Number of particles to sample (or 'all' for all particles)
+        """
+        import csv
+        
+        if self.num_particles == 0:
+            print("No particles to diagnose")
+            return
+        
+        # Select sample indices
+        if num_samples == 'all' or num_samples >= self.num_particles:
+            sample_indices = cp.arange(self.num_particles)
+        else:
+            # Sample uniformly across all particles
+            step = max(1, self.num_particles // num_samples)
+            sample_indices = cp.arange(0, self.num_particles, step)
+        
+        # Get sample particles
+        sample_particles = self.particles[sample_indices]
+        sample_particles2 = self.particles2[sample_indices]
+        sample_vel = self.particles_vel[sample_indices]
+        sample_vel2 = self.particles2_vel[sample_indices]
+        
+        # Compute forces (same as step_particles)
+        flow_contrib = self.compute_gradient_contributions(sample_particles, self.flowfield)
+        flow_contrib2 = -self.compute_gradient_contributions(sample_particles2, self.flowfield)
+        
+        curl_contrib = self.compute_curl_contributions(sample_particles, self.curlfield)
+        curl_contrib2 = -self.compute_curl_contributions(sample_particles2, self.curlfield)
+        
+        # Sample field values at particle positions
+        density_at_p1 = self._sample_scalar_field_at_points(sample_particles, self.densityfield)
+        density_at_p2 = self._sample_scalar_field_at_points(sample_particles2, self.densityfield)
+        
+        # Convert to numpy for CSV writing
+        sample_particles_np = cp.asnumpy(sample_particles)
+        sample_particles2_np = cp.asnumpy(sample_particles2)
+        sample_vel_np = cp.asnumpy(sample_vel)
+        sample_vel2_np = cp.asnumpy(sample_vel2)
+        flow_contrib_np = cp.asnumpy(flow_contrib)
+        flow_contrib2_np = cp.asnumpy(flow_contrib2)
+        curl_contrib_np = cp.asnumpy(curl_contrib)
+        curl_contrib2_np = cp.asnumpy(curl_contrib2)
+        density_at_p1_np = cp.asnumpy(density_at_p1)
+        density_at_p2_np = cp.asnumpy(density_at_p2)
+        
+        # Calculate domain bounds for corner detection
+        half_lx = self.LX * self.NX / 2
+        half_ly = self.LY * self.NY / 2
+        half_lz = self.LZ * self.NZ / 2
+        corner_threshold = min(self.LX, self.LY, self.LZ) * 3  # Within 3 cells of corner
+        
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow([
+                'particle_set', 'particle_id', 'global_id',
+                'pos_x', 'pos_y', 'pos_z',
+                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
+                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
+                'curl_contrib_x', 'curl_contrib_y', 'curl_contrib_z', 'curl_contrib_mag',
+                'density_at_particle',
+                'dist_to_center', 'near_corner',
+                'normalized_pos_x', 'normalized_pos_y', 'normalized_pos_z'
+            ])
+            
+            # Write particle set 1
+            for i, idx in enumerate(sample_indices.get()):
+                pos = sample_particles_np[i]
+                vel = sample_vel_np[i]
+                flow_f = flow_contrib_np[i]
+                curl_f = curl_contrib_np[i]
+                density = density_at_p1_np[i]
+                
+                vel_mag = cp.linalg.norm(vel)
+                flow_mag = cp.linalg.norm(flow_f)
+                curl_mag = cp.linalg.norm(curl_f)
+                dist_center = cp.linalg.norm(pos)
+                
+                # Check if near corner (all 3 coords near max/min)
+                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
+                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
+                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
+                near_corner = near_x and near_y and near_z
+                
+                # Normalized position [-1, 1] in each dimension
+                norm_x = pos[0] / half_lx
+                norm_y = pos[1] / half_ly
+                norm_z = pos[2] / half_lz
+                
+                writer.writerow([
+                    'set1', i, int(idx),
+                    pos[0], pos[1], pos[2],
+                    vel[0], vel[1], vel[2], vel_mag,
+                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
+                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
+                    density,
+                    dist_center, near_corner,
+                    norm_x, norm_y, norm_z
+                ])
+            
+            # Write particle set 2
+            for i, idx in enumerate(sample_indices.get()):
+                pos = sample_particles2_np[i]
+                vel = sample_vel2_np[i]
+                flow_f = flow_contrib2_np[i]
+                curl_f = curl_contrib2_np[i]
+                density = density_at_p2_np[i]
+                
+                vel_mag = cp.linalg.norm(vel)
+                flow_mag = cp.linalg.norm(flow_f)
+                curl_mag = cp.linalg.norm(curl_f)
+                dist_center = cp.linalg.norm(pos)
+                
+                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
+                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
+                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
+                near_corner = near_x and near_y and near_z
+                
+                norm_x = pos[0] / half_lx
+                norm_y = pos[1] / half_ly
+                norm_z = pos[2] / half_lz
+                
+                writer.writerow([
+                    'set2', i, int(idx),
+                    pos[0], pos[1], pos[2],
+                    vel[0], vel[1], vel[2], vel_mag,
+                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
+                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
+                    density,
+                    dist_center, near_corner,
+                    norm_x, norm_y, norm_z
+                ])
+        
+        print(f"Exported {len(sample_indices) * 2} particle diagnostics to {csv_path}")
+    
+    def _sample_scalar_field_at_points(self, points, field):
+        """Sample scalar field values at particle positions using trilinear interpolation."""
+        # Convert positions to grid indices
+        ix = ((points[:, 0] / self.LX) + self.NX / 2).astype(cp.int32)
+        iy = ((points[:, 1] / self.LY) + self.NY / 2).astype(cp.int32)
+        iz = ((points[:, 2] / self.LZ) + self.NZ / 2).astype(cp.int32)
+        
+        # Wrap indices
+        ix = cp.mod(ix, self.NX)
+        iy = cp.mod(iy, self.NY)
+        iz = cp.mod(iz, self.NZ)
+        
+        # Sample field at nearest grid point (simple nearest-neighbor for diagnostics)
+        return field[iz, iy, ix]
+
+

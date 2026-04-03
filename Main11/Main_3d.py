@@ -6,9 +6,9 @@ from viz_2d_snapshot import save_2d_snapshot
 def main():
     try:
         sim = WorldStep(
-            nx=100,
-            ny=100,
-            nz=100,
+            nx=200,
+            ny=50,
+            nz=50,
             lx=0.1,
             ly=0.1,
             lz=0.1,

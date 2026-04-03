@@ -1,6 +1,10 @@
-import cupy as cp
-import math
+import os
+import tempfile
 import time
+import math
+
+import cupy as cp
+import numpy as np
 
 class WorldStep:
 
@@ -29,7 +33,8 @@ class WorldStep:
             nx=50, ny=50, nz=50,
             lx=4.0, ly=4.0, lz=4.0,
             k1_size=3, k2_size=2, k3_size=3, k4_size=2, k5_size=2,
-            seed=0, device_id=None):
+            seed=0, device_id=None, global_nz_start=0, global_nz_total=None,
+            partition_index=0, partition_count=1, halo_exchange_dir=None, halo_timeout_s=10.0):
         
         self.device_id = device_id
         if device_id is not None:
@@ -42,6 +47,8 @@ class WorldStep:
         self.LY = ly
         self.LZ = lz
         self.seed = seed
+        self.global_nz_start = int(global_nz_start)
+        self.global_nz_total = int(global_nz_total) if global_nz_total is not None else int(nz)
 
         # base magnitude for flow vectors
         self.base_eddy = float(base_eddy)
@@ -49,7 +56,7 @@ class WorldStep:
         self.particle_mass1 = particle_mass1
         self.particle_mass2 = particle_mass2
         self.damping = damping
-        self.enable_particles = enable_particles
+        self.enable_particles = False
         
         # Particle behavior parameters
         self.particle_velocity_max = particle_velocity_max
@@ -67,28 +74,24 @@ class WorldStep:
         self.k4_size = k4_size
         self.k5_size = k5_size
 
+        self.partition_index = max(0, int(partition_index))
+        self.partition_count = max(1, int(partition_count))
+        self.halo_width = max((self.k1_size - 1) // 2, self.k2_size, self.k5_size)
+        self.halo_exchange_dir = halo_exchange_dir or os.path.join(tempfile.gettempdir(), "main11server_halo")
+        self.halo_timeout_s = float(halo_timeout_s)
+        self.halo_exchange_enabled = self.partition_count > 1
+        self.halo_session_id = f"nz{self.global_nz_total}_parts{self.partition_count}"
+        self._halo_exchange_seq = 0
+        if self.halo_exchange_enabled:
+            os.makedirs(self.halo_exchange_dir, exist_ok=True)
+
         self.init_kernels()
-        # initialize fields to zeros (curl/density); flow is seeded below
-        if enable_particles:
-            # FIXED: Add half-cell offset to prevent particles from initializing ON boundaries
-            # Particles at exact boundaries (-5.0) cause phantom forces; offset places them inside domain (-4.95)
-            self.particles = self.generate_initial_particles(nx, ny, nz,
-                origin=(-lx * nx / 2 + lx*0.5, -ly * ny / 2 + ly*0.5, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
-                , step=particle_dispersion)
-            self.particles_vel = cp.zeros_like(self.particles)
-            # second particle set (initialized with full-cell offset)
-            self.particles2 = self.generate_initial_particles(nx, ny, nz,
-                origin=(-lx * nx / 2 + lx*1.0, -ly * ny / 2 + ly*1.0, -lz * nz / 2 + lz*0.5), spacing=(lx, ly, lz)
-                , step=particle_dispersion)
-            self.particles2_vel = cp.zeros_like(self.particles2)
-            self.num_particles = self.particles.shape[0]
-        else:
-            # Create empty particle arrays
-            self.particles = cp.zeros((0, 3), dtype=cp.float32)
-            self.particles_vel = cp.zeros((0, 3), dtype=cp.float32)
-            self.particles2 = cp.zeros((0, 3), dtype=cp.float32)
-            self.particles2_vel = cp.zeros((0, 3), dtype=cp.float32)
-            self.num_particles = 0
+        # Particle functionality is disabled in the server build to simplify NZ splitting.
+        self.particles = cp.zeros((0, 3), dtype=cp.float32)
+        self.particles_vel = cp.zeros((0, 3), dtype=cp.float32)
+        self.particles2 = cp.zeros((0, 3), dtype=cp.float32)
+        self.particles2_vel = cp.zeros((0, 3), dtype=cp.float32)
+        self.num_particles = 0
         # initialize fields to zeros to avoid uninitialized memory
         self.curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         self.curlfield_prev = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
@@ -201,158 +204,15 @@ class WorldStep:
         self.mean_weights = [w / self.ahat5_weight for w in self.mean_weights]
 
     def enable_particle_tracking(self, num_particles_to_track=5):
-        """Enable trajectory tracking for a subset of particles.
-        
-        Args:
-            num_particles_to_track: Number of particles to track (evenly distributed)
-        """
-        if self.num_particles == 0:
-            print("No particles to track")
-            return
-        
-        # Select evenly distributed particles
-        step = max(1, self.num_particles // num_particles_to_track)
-        self.tracked_particle_indices = list(range(0, self.num_particles, step))[:num_particles_to_track]
-        self.tracking_enabled = True
-        self.trajectory_data = []
-        self.step_count = 0
-        print(f"Tracking {len(self.tracked_particle_indices)} particles: {self.tracked_particle_indices}")
+        """Particle tracking is disabled in the server build."""
+        print("Particle tracking has been removed from Main11Server.")
     
     def _record_tracked_particles(self):
-        """Record current state of tracked particles."""
-        if not self.tracking_enabled or len(self.tracked_particle_indices) == 0:
-            return
-        
-        # Compute forces for tracked particles
-        tracked_indices_cp = cp.array(self.tracked_particle_indices, dtype=cp.int32)
-        
-        # Get particle data
-        tracked_pos1 = self.particles[tracked_indices_cp]
-        tracked_pos2 = self.particles2[tracked_indices_cp]
-        tracked_vel1 = self.particles_vel[tracked_indices_cp]
-        tracked_vel2 = self.particles2_vel[tracked_indices_cp]
-        
-        # Compute forces
-        flow_force1 = self.compute_gradient_contributions(tracked_pos1, self.flowfield)
-        flow_force2 = -self.compute_gradient_contributions(tracked_pos2, self.flowfield)
-        curl_force1 = self.compute_curl_contributions(tracked_pos1, self.curlfield)
-        curl_force2 = -self.compute_curl_contributions(tracked_pos2, self.curlfield)
-        
-        # Sample density
-        density1 = self._sample_scalar_field_at_points(tracked_pos1, self.densityfield)
-        density2 = self._sample_scalar_field_at_points(tracked_pos2, self.densityfield)
-        
-        # Convert to numpy
-        tracked_pos1_np = cp.asnumpy(tracked_pos1)
-        tracked_pos2_np = cp.asnumpy(tracked_pos2)
-        tracked_vel1_np = cp.asnumpy(tracked_vel1)
-        tracked_vel2_np = cp.asnumpy(tracked_vel2)
-        flow_force1_np = cp.asnumpy(flow_force1)
-        flow_force2_np = cp.asnumpy(flow_force2)
-        curl_force1_np = cp.asnumpy(curl_force1)
-        curl_force2_np = cp.asnumpy(curl_force2)
-        density1_np = cp.asnumpy(density1)
-        density2_np = cp.asnumpy(density2)
-        
-        # Store data for both particle sets
-        for i, particle_id in enumerate(self.tracked_particle_indices):
-            # Set 1
-            self.trajectory_data.append({
-                'step': self.step_count,
-                'particle_set': 'set1',
-                'particle_id': particle_id,
-                'pos_x': tracked_pos1_np[i, 0],
-                'pos_y': tracked_pos1_np[i, 1],
-                'pos_z': tracked_pos1_np[i, 2],
-                'vel_x': tracked_vel1_np[i, 0],
-                'vel_y': tracked_vel1_np[i, 1],
-                'vel_z': tracked_vel1_np[i, 2],
-                'flow_force_x': flow_force1_np[i, 0],
-                'flow_force_y': flow_force1_np[i, 1],
-                'flow_force_z': flow_force1_np[i, 2],
-                'curl_force_x': curl_force1_np[i, 0],
-                'curl_force_y': curl_force1_np[i, 1],
-                'curl_force_z': curl_force1_np[i, 2],
-                'density': density1_np[i]
-            })
-            
-            # Set 2
-            self.trajectory_data.append({
-                'step': self.step_count,
-                'particle_set': 'set2',
-                'particle_id': particle_id,
-                'pos_x': tracked_pos2_np[i, 0],
-                'pos_y': tracked_pos2_np[i, 1],
-                'pos_z': tracked_pos2_np[i, 2],
-                'vel_x': tracked_vel2_np[i, 0],
-                'vel_y': tracked_vel2_np[i, 1],
-                'vel_z': tracked_vel2_np[i, 2],
-                'flow_force_x': flow_force2_np[i, 0],
-                'flow_force_y': flow_force2_np[i, 1],
-                'flow_force_z': flow_force2_np[i, 2],
-                'curl_force_x': curl_force2_np[i, 0],
-                'curl_force_y': curl_force2_np[i, 1],
-                'curl_force_z': curl_force2_np[i, 2],
-                'density': density2_np[i]
-            })
+        return
     
     def export_particle_trajectories(self, csv_path='particle_trajectories.csv'):
-        """Export tracked particle trajectories to CSV.
-        
-        Args:
-            csv_path: Output CSV file path
-        """
-        import csv
-        
-        if not self.tracking_enabled or len(self.trajectory_data) == 0:
-            print("No trajectory data to export. Enable tracking with enable_particle_tracking() first.")
-            return
-        
-        with open(csv_path, 'w', newline='') as f:
-            fieldnames = [
-                'step', 'particle_set', 'particle_id',
-                'pos_x', 'pos_y', 'pos_z',
-                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
-                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
-                'curl_force_x', 'curl_force_y', 'curl_force_z', 'curl_force_mag',
-                'density', 'dist_to_center'
-            ]
-            
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for row in self.trajectory_data:
-                # Calculate magnitudes
-                vel_mag = (row['vel_x']**2 + row['vel_y']**2 + row['vel_z']**2)**0.5
-                flow_mag = (row['flow_force_x']**2 + row['flow_force_y']**2 + row['flow_force_z']**2)**0.5
-                curl_mag = (row['curl_force_x']**2 + row['curl_force_y']**2 + row['curl_force_z']**2)**0.5
-                dist = (row['pos_x']**2 + row['pos_y']**2 + row['pos_z']**2)**0.5
-                
-                writer.writerow({
-                    'step': row['step'],
-                    'particle_set': row['particle_set'],
-                    'particle_id': row['particle_id'],
-                    'pos_x': row['pos_x'],
-                    'pos_y': row['pos_y'],
-                    'pos_z': row['pos_z'],
-                    'vel_x': row['vel_x'],
-                    'vel_y': row['vel_y'],
-                    'vel_z': row['vel_z'],
-                    'vel_mag': vel_mag,
-                    'flow_force_x': row['flow_force_x'],
-                    'flow_force_y': row['flow_force_y'],
-                    'flow_force_z': row['flow_force_z'],
-                    'flow_force_mag': flow_mag,
-                    'curl_force_x': row['curl_force_x'],
-                    'curl_force_y': row['curl_force_y'],
-                    'curl_force_z': row['curl_force_z'],
-                    'curl_force_mag': curl_mag,
-                    'density': row['density'],
-                    'dist_to_center': dist
-                })
-        
-        print(f"Exported {len(self.trajectory_data)} trajectory records to {csv_path}")
-        print(f"Tracked {len(self.tracked_particle_indices)} particles across {self.step_count} steps")
+        """Particle trajectory export is disabled in the server build."""
+        print("Particle trajectory export has been removed from Main11Server.")
 
     def init_densityfield(self):
         # Properly initialize densityfield with random values in [-1,1]
@@ -371,7 +231,7 @@ class WorldStep:
             seed = int(getattr(self, "seed", 0))
         mag = float(magnitude) if magnitude is not None else float(self.base_eddy)
 
-        rng = cp.random.RandomState(seed)
+        rng = cp.random.RandomState(seed + self.partition_index)
         shape = (self.NZ, self.NY, self.NX, 3)
         # Draw normal components, normalize to unit vectors, then scale
         vecs = rng.normal(loc=0.0, scale=1.0, size=shape).astype(cp.float32)
@@ -380,43 +240,128 @@ class WorldStep:
         dirs = vecs / norms
         self.flowfield = dirs * mag
         return self.flowfield
+
+    def _next_halo_exchange_tag(self, tag_base):
+        tag = f"session_{self.halo_session_id}_step{int(self.step_count):06d}_seq{int(self._halo_exchange_seq):03d}_{tag_base}"
+        self._halo_exchange_seq += 1
+        return tag
+
+    def _halo_file_path(self, tag, partition_index, side):
+        return os.path.join(self.halo_exchange_dir, f"{tag}_p{int(partition_index)}_{side}.npy")
+
+    def _write_halo_file(self, file_path, arr):
+        tmp_path = f"{file_path}.tmp.npy"
+        np.save(tmp_path, arr, allow_pickle=False)
+        os.replace(tmp_path, file_path)
+
+    def _wait_for_halo_file(self, file_path):
+        deadline = time.perf_counter() + self.halo_timeout_s
+        while time.perf_counter() < deadline:
+            if os.path.exists(file_path):
+                try:
+                    age_s = time.time() - os.path.getmtime(file_path)
+                    if age_s > max(5.0, self.halo_timeout_s * 4.0):
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                        time.sleep(0.002)
+                        continue
+                    arr = np.load(file_path, allow_pickle=False)
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
+                    return arr
+                except Exception:
+                    time.sleep(0.002)
+                    continue
+            time.sleep(0.002)
+        raise TimeoutError(f"Timed out waiting for halo file: {file_path}")
+
+    def _exchange_halos_z(self, field, halo_width, tag_base):
+        if not self.halo_exchange_enabled or halo_width <= 0:
+            return None, None, 0
+
+        actual_width = min(int(halo_width), int(field.shape[0]))
+        tag = self._next_halo_exchange_tag(tag_base)
+        left_neighbor = (self.partition_index - 1) % self.partition_count
+        right_neighbor = (self.partition_index + 1) % self.partition_count
+
+        self._write_halo_file(self._halo_file_path(tag, self.partition_index, "left"), cp.asnumpy(field[:actual_width]))
+        self._write_halo_file(self._halo_file_path(tag, self.partition_index, "right"), cp.asnumpy(field[-actual_width:]))
+
+        left_np = self._wait_for_halo_file(self._halo_file_path(tag, left_neighbor, "right"))
+        right_np = self._wait_for_halo_file(self._halo_file_path(tag, right_neighbor, "left"))
+        return cp.asarray(left_np), cp.asarray(right_np), actual_width
+
+    def _get_field_with_halo(self, field, halo_width, tag_base):
+        if not self.halo_exchange_enabled or halo_width <= 0:
+            return field, 0
+        left_halo, right_halo, actual_width = self._exchange_halos_z(field, halo_width, tag_base)
+        return cp.concatenate((left_halo, field, right_halo), axis=0), actual_width
+
+    def _crop_local_z(self, field, halo_width):
+        if halo_width <= 0:
+            return field
+        return field[halo_width:halo_width + self.NZ, ...]
+
+    def _roll_z(self, field, shift, tag_base="zroll"):
+        shift = int(shift)
+        if not self.halo_exchange_enabled or shift == 0:
+            return cp.roll(field, shift=shift, axis=0)
+        padded_field, halo = self._get_field_with_halo(field, abs(shift), tag_base=tag_base)
+        shifted = cp.roll(padded_field, shift=shift, axis=0)
+        return self._crop_local_z(shifted, halo)
     
     def calculate_gradientfield_kernal(self, field):
+        padded_field, halo = self._get_field_with_halo(field, self.k2_size, tag_base="gradient")
         gradientfield = cp.zeros_like(field)
         gradientfield = cp.stack((gradientfield, gradientfield, gradientfield), axis=-1)
         for weight, shift, offset in zip(self.gradient_weights, self.gradient_shifts, self.gradient_offsets):
-            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            shifted = cp.roll(padded_field, shift=shift, axis=(0, 1, 2))
+            shifted = self._crop_local_z(shifted, halo)
             gradientfield[..., 0] += weight * shifted * offset[0]
             gradientfield[..., 1] += weight * shifted * offset[1]
             gradientfield[..., 2] += weight * shifted * offset[2]
         return gradientfield
     
     def calculate_divergence_from_flow_kernal(self, field):
+        padded_field, halo = self._get_field_with_halo(field, self.k2_size, tag_base="divergence")
         divergencefield = cp.zeros((self.NZ, self.NY, self.NX), dtype=cp.float32)
         for weight, shift, offset in zip(self.divergence_weights, self.divergence_shifts, self.divergence_offsets):
-            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            shifted = cp.roll(padded_field, shift=shift, axis=(0, 1, 2))
+            shifted = self._crop_local_z(shifted, halo)
             divergencefield += weight * (shifted[...,0] * offset[0] + shifted[...,1] * offset[1] + shifted[...,2] * offset[2])
         return divergencefield
     
     def calculate_curlfield_kernal(self, field):
+        curl_halo = max(0, (self.k1_size - 1) // 2)
+        padded_field, halo = self._get_field_with_halo(field, curl_halo, tag_base="curl")
         curlfield = cp.zeros((self.NZ, self.NY, self.NX, 3), dtype=cp.float32)
         for weight, shift, r_vec in zip(self.curl_weights, self.curl_shifts, self.curl_rvecs):
-            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            shifted = cp.roll(padded_field, shift=shift, axis=(0, 1, 2))
+            shifted = self._crop_local_z(shifted, halo)
             curlfield += weight * cp.cross(r_vec, shifted)
         return curlfield
     
 
     def diffuse_field_kernal(self, field):
+        diffuse_halo = max(0, (self.k1_size - 1) // 2)
+        padded_field, halo = self._get_field_with_halo(field, diffuse_halo, tag_base="diffuse")
         diffused_field = cp.zeros_like(field)
         for weight, shift in zip(self.diffuse_weights, self.diffuse_shifts):
-            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            shifted = cp.roll(padded_field, shift=shift, axis=(0, 1, 2))
+            shifted = self._crop_local_z(shifted, halo)
             diffused_field += weight * shifted
         return diffused_field
     
     def fieldmean(self, field):
+        padded_field, halo = self._get_field_with_halo(field, self.k5_size, tag_base="fieldmean")
         mean_fields = cp.zeros_like(field)
         for weight, shift in zip(self.mean_weights, self.mean_shifts):
-            shifted = cp.roll(field, shift=shift, axis=(0, 1, 2))
+            shifted = cp.roll(padded_field, shift=shift, axis=(0, 1, 2))
+            shifted = self._crop_local_z(shifted, halo)
             mean_fields += weight * shifted
         return mean_fields
 
@@ -425,10 +370,7 @@ class WorldStep:
 
     def step(self, dt=0.1, print_timings=True):
         timings = {}
-        
-        # Track particles at start of step (before forces are applied)
-        if self.tracking_enabled:
-            self._record_tracked_particles()
+        self._halo_exchange_seq = 0
         
         t0 = time.perf_counter()
         self.step_densityfield(dt)
@@ -439,10 +381,6 @@ class WorldStep:
         timings['densityfield2'] = time.perf_counter() - t0
         
         t0 = time.perf_counter()
-        gradientfield = self.calculate_gradientfield_kernal(self.densityfield)
-        timings['gradient'] = time.perf_counter() - t0
-        
-        t0 = time.perf_counter()
         self.step_flowfield(dt)
         timings['flowfield'] = time.perf_counter() - t0
         
@@ -450,19 +388,8 @@ class WorldStep:
         self.step_curlfield(dt, print_timings=print_timings)
         timings['curlfield'] = time.perf_counter() - t0
         
-        if self.enable_particles:
-            t0 = time.perf_counter()
-            self.step_particles(dt)
-            timings['particles'] = time.perf_counter() - t0
-            
-            t0 = time.perf_counter()
-            self.inject_particles_to_density1(strength_pos=self.density1_injection_strength_pos, strength_neg=self.density1_injection_strength_neg)
-            timings['inject_density1'] = time.perf_counter() - t0
-            
-            t0 = time.perf_counter()
-            self.inject_particles_to_density2(strength=self.density2_injection_strength)
-            timings['inject_density2'] = time.perf_counter() - t0
-        
+        # Particle advection/injection removed in the server build.
+
         if print_timings:
             total = sum(timings.values())
             print(f"Step timings (ms): total={total*1000:.2f}")
@@ -505,7 +432,7 @@ class WorldStep:
         
         # Inject from energy of field 1 (optional, can be disabled by setting strength to 0)
         if injection_strength > 0:
-            flow0 = cp.roll(self.flowfield, shift=1, axis=0)
+            flow0 = self._roll_z(self.flowfield, shift=1, tag_base="density2_energy")
             flow1 = cp.roll(self.flowfield, shift=1, axis=1)
             flow2 = cp.roll(self.flowfield, shift=1, axis=2)
             flow01 = cp.roll(flow0, shift=1, axis=1)
@@ -526,7 +453,7 @@ class WorldStep:
     def step_flowfield(self, dt=0.1, flow_diffusion_rate=0.05):
         """Update flow field using density gradients and eddy effects."""
         # Pressure gradient from density
-        functionfield0 = cp.roll(self.densityfield2, shift=1, axis=0)
+        functionfield0 = self._roll_z(self.densityfield2, shift=1, tag_base="flowfield_pressure")
         functionfield1 = cp.roll(self.densityfield2, shift=1, axis=1)
         functionfield2 = cp.roll(self.densityfield2, shift=1, axis=2)
         functionfield01 = cp.roll(functionfield0, shift=1, axis=1)
@@ -601,115 +528,16 @@ class WorldStep:
                 print(f"    {name:20s}: {t*1000:6.2f} ms ({t/total*100:5.1f}%)")
 
     def step_particles(self, dt=0.1, density2_follow_strength=None):
-        """Advect both particle sets using flow field and densityfield2 gradient.
-        
-        density2_follow_strength: how strongly particles follow densityfield2 gradient (None uses class default)
-        """
-        if density2_follow_strength is None:
-            density2_follow_strength = self.density2_follow_strength
-        # Track previous positions for both sets
-        self.particles_vel = cp.copy(self.particles)
-        self.particles2_vel = cp.copy(self.particles2)
-        
-        # Get impulse from gradient field (flow field influences particle motion)
-        flow_contrib = self.compute_gradient_contributions(self.particles, self.flowfield)
-        flow_contrib2 = -self.compute_gradient_contributions(self.particles2, self.flowfield)
-        
-        # Get gradient contribution from densityfield2 (particles follow density uphill)
-        if density2_follow_strength > 0:
-            density2_grad = self.calculate_gradientfield_kernal(self.densityfield2)
-            density2_contrib = self.compute_gradient_contributions(self.particles, density2_grad)
-            density2_contrib2 = self.compute_gradient_contributions(self.particles2, density2_grad)
-            flow_contrib += density2_contrib * density2_follow_strength
-            flow_contrib2 += density2_contrib2 * density2_follow_strength
-        
-        # Update velocity and position for both sets
-        self.particles_vel += flow_contrib * (dt / self.particle_mass1)
-        self.particles2_vel += flow_contrib2 * (dt / self.particle_mass2)
-
-        curl_contrib = self.compute_curl_contributions(self.particles, self.curlfield)
-        curl_contrib2 = -self.compute_curl_contributions(self.particles2, self.curlfield)
-
-        curl_strength1 = cp.sqrt(cp.sum(curl_contrib * curl_contrib, axis=1)) / self.particle_mass1
-        curl_strength2 = cp.sqrt(cp.sum(curl_contrib2 * curl_contrib2, axis=1)) / self.particle_mass2
-
-        curl_strength1 = cp.stack([curl_strength1, curl_strength1, curl_strength1], axis=1)
-        curl_strength2 = cp.stack([curl_strength2, curl_strength2, curl_strength2], axis=1)
-
-        particles_vel_curl = cp.cross(self.particles_vel, curl_contrib) / (curl_strength1 * self.particle_mass1 + 1e-9)
-        particles2_vel_curl = cp.cross(self.particles2_vel, curl_contrib2) / (curl_strength2 * self.particle_mass2 + 1e-9)
-
-        self.particles_vel = self.particles_vel * cp.cos(curl_strength1 * dt) + particles_vel_curl * cp.sin(curl_strength1 * dt)
-        self.particles2_vel = self.particles2_vel * cp.cos(curl_strength2 * dt) + particles2_vel_curl * cp.sin(curl_strength2 * dt)
-
-        self.particles_vel = WorldStep.clamp_magnitude_gpu(self.particles_vel, max_len=self.particle_velocity_max)
-        self.particles2_vel = WorldStep.clamp_magnitude_gpu(self.particles2_vel, max_len=self.particle_velocity_max)
-        
-        # Update positions
-
-        self.particles += self.particles_vel * dt
-        self.particles2 += self.particles2_vel * dt
-        
-        # Apply toroidal wrapping/boundary conditions
-        # Domain bounds: [-L*NX/2, L*NX/2] in each dimension
-        half_lx = self.LX * self.NX / 2
-        half_ly = self.LY * self.NY / 2
-        half_lz = self.LZ * self.NZ / 2
-        
-        # Wrap particles that go out of bounds (periodic boundary conditions)
-        self.particles[..., 0] = cp.mod(self.particles[..., 0] + half_lx, self.LX * self.NX) - half_lx
-        self.particles[..., 1] = cp.mod(self.particles[..., 1] + half_ly, self.LY * self.NY) - half_ly
-        self.particles[..., 2] = cp.mod(self.particles[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
-        
-        self.particles2[..., 0] = cp.mod(self.particles2[..., 0] + half_lx, self.LX * self.NX) - half_lx
-        self.particles2[..., 1] = cp.mod(self.particles2[..., 1] + half_ly, self.LY * self.NY) - half_ly
-        self.particles2[..., 2] = cp.mod(self.particles2[..., 2] + half_lz, self.LZ * self.NZ) - half_lz
+        """Particle stepping is disabled in the server build."""
+        return
 
     def inject_particles_to_density2(self, strength=0.1):
-        """Inject particle density into densityfield2 at particle locations.
-        
-        strength: how much density each particle contributes (0 to 1 range)
-        """
-        # Map particle positions to grid indices
-        half_lx = self.LX * self.NX / 2
-        half_ly = self.LY * self.NY / 2
-        half_lz = self.LZ * self.NZ / 2
-        
-        # Convert positions to normalized indices [0, N)
-        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
-        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
-        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
-        
-        # Add density contribution from particles
-        cp.add.at(self.densityfield2, (iz, iy, ix), strength)
-        
-        # Also inject particles2 (opposite set)
-        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
-        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
-        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
-        
-        cp.add.at(self.densityfield2, (iz2, iy2, ix2), strength)
+        """Particle-to-density injection is disabled in the server build."""
+        return
 
     def inject_particles_to_density1(self, strength_pos=-.10, strength_neg=-.10):
-        """Inject particles into densityfield with opposite signs by type.
-
-        particles  (set1) add +strength_pos; particles2 add -strength_neg.
-        """
-        half_lx = self.LX * self.NX / 2
-        half_ly = self.LY * self.NY / 2
-        half_lz = self.LZ * self.NZ / 2
-
-        # set1 indices
-        ix = cp.mod(cp.floor((self.particles[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
-        iy = cp.mod(cp.floor((self.particles[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
-        iz = cp.mod(cp.floor((self.particles[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
-        cp.add.at(self.densityfield, (iz, iy, ix), strength_pos)
-
-        # set2 indices
-        ix2 = cp.mod(cp.floor((self.particles2[:, 0] + half_lx) / self.LX).astype(cp.int32), self.NX)
-        iy2 = cp.mod(cp.floor((self.particles2[:, 1] + half_ly) / self.LY).astype(cp.int32), self.NY)
-        iz2 = cp.mod(cp.floor((self.particles2[:, 2] + half_lz) / self.LZ).astype(cp.int32), self.NZ)
-        cp.add.at(self.densityfield, (iz2, iy2, ix2), -strength_neg)
+        """Particle-to-density injection is disabled in the server build."""
+        return
 
 
     def clamp_magnitude_gpu(points, max_len):
@@ -854,76 +682,138 @@ class WorldStep:
     # Vertex generation for rendering
     # -------------------------
     def build_point_vertices(self, min_size=3.0, max_size=18.0):
-        """
-        Returns a CuPy array of shape (2*num_particles, 8):
-          [x, y, z, r, g, b, size, alpha]
-        for point cloud visualization with two particle sets.
-        First 50% colored by velocity, second 50% colored cyan.
-        """
-        n_particles = self.num_particles
-        
-        # Handle empty particle case
-        if n_particles == 0:
-            return cp.empty((0, 8), dtype=cp.float32)
-        
-        verts = cp.empty((2 * n_particles, 8), dtype=cp.float32)
-
-        # First particle set: positions and velocity-based colors
-        verts[0:n_particles, 0:3] = self.particles
-        A = self.particles_vel
-        mag_A = cp.sqrt(A[..., 0]**2 + A[..., 1]**2 + A[..., 2]**2) + 1e-6
-        normA = A / mag_A[:, cp.newaxis]
-        verts[0:n_particles, 3] = normA[..., 0] * 0.5 + 0.5
-        verts[0:n_particles, 4] = normA[..., 1] * 0.5 + 0.5
-        verts[0:n_particles, 5] = normA[..., 2] * 0.5 + 0.5
-        # size scaled by speed magnitude
-        speed = mag_A
-        speed_norm = speed / (cp.max(speed) + 1e-6)
-        size = min_size + (max_size - min_size) * speed_norm
-        verts[0:n_particles, 6] = size
-        verts[0:n_particles, 7] = 1.0  # opaque
-
-        # Second particle set: positions and fixed cyan color
-        verts[n_particles:2*n_particles, 0:3] = self.particles2
-        verts[n_particles:2*n_particles, 3] = 0.2  # cyan: low red
-        verts[n_particles:2*n_particles, 4] = 0.9  # cyan: high green
-        verts[n_particles:2*n_particles, 5] = 0.9  # cyan: high blue
-        # give second set a slightly larger base size
-        verts[n_particles:2*n_particles, 6] = min_size * 1.2
-        verts[n_particles:2*n_particles, 7] = 1.0  # opaque
-
-        return verts
+        """Particle vertices are disabled in the server build."""
+        return cp.empty((0, 8), dtype=cp.float32)
 
     def build_point_vertices_region(self, region=None, min_size=3.0, max_size=18.0, stride=1):
-        """Return point vertices optionally filtered to a spatial region.
+        """Particle vertices are disabled in the server build."""
+        return cp.empty((0, 8), dtype=cp.float32)
 
-        region format:
-            {
-                'x': (xmin, xmax),
-                'y': (ymin, ymax),
-                'z': (zmin, zmax),
-            }
-        Any missing axis is left unfiltered.
-        """
-        verts = self.build_point_vertices(min_size=min_size, max_size=max_size)
-        if verts.shape[0] == 0:
-            return verts
-
-        if region:
-            mask = cp.ones((verts.shape[0],), dtype=cp.bool_)
-            for axis_idx, axis_name in enumerate(("x", "y", "z")):
-                bounds = region.get(axis_name) if isinstance(region, dict) else None
-                if bounds is None:
-                    continue
-                lo, hi = float(bounds[0]), float(bounds[1])
-                mask &= (verts[:, axis_idx] >= lo) & (verts[:, axis_idx] <= hi)
-            verts = verts[mask]
-
+    def _get_region_slices(self, region=None, stride=1, max_cells=None):
         stride = max(1, int(stride))
-        if stride > 1 and verts.shape[0] > 0:
-            verts = verts[::stride]
 
-        return verts
+        def _axis_bounds(axis_name, axis_size, spacing, global_start=0, global_total=None):
+            if not region or axis_name not in region or region[axis_name] is None:
+                return 0, axis_size
+
+            lo, hi = region[axis_name]
+            lo = float(lo)
+            hi = float(hi)
+            lo, hi = min(lo, hi), max(lo, hi)
+
+            if global_total is None:
+                start = int(math.floor(lo / spacing + axis_size / 2))
+                stop = int(math.ceil(hi / spacing + axis_size / 2))
+            else:
+                start = int(math.floor(lo / spacing + global_total / 2)) - global_start
+                stop = int(math.ceil(hi / spacing + global_total / 2)) - global_start
+
+            start = max(0, min(axis_size - 1, start))
+            stop = max(start + 1, min(axis_size, stop))
+            return start, stop
+
+        z0, z1 = _axis_bounds("z", self.NZ, self.LZ, global_start=self.global_nz_start, global_total=self.global_nz_total)
+        y0, y1 = _axis_bounds("y", self.NY, self.LY)
+        x0, x1 = _axis_bounds("x", self.NX, self.LX)
+
+        if max_cells:
+            while (math.ceil((z1 - z0) / stride) * math.ceil((y1 - y0) / stride) * math.ceil((x1 - x0) / stride)) > max_cells:
+                stride += 1
+
+        index_bounds = {
+            "z": (int(z0), int(z1)),
+            "y": (int(y0), int(y1)),
+            "x": (int(x0), int(x1)),
+        }
+        world_bounds = {
+            "x": (float((x0 - self.NX / 2) * self.LX), float((max(x0, x1 - 1) - self.NX / 2) * self.LX)),
+            "y": (float((y0 - self.NY / 2) * self.LY), float((max(y0, y1 - 1) - self.NY / 2) * self.LY)),
+            "z": (
+                float(((self.global_nz_start + z0) - self.global_nz_total / 2) * self.LZ),
+                float(((self.global_nz_start + max(z0, z1 - 1)) - self.global_nz_total / 2) * self.LZ),
+            ),
+        }
+
+        return slice(z0, z1, stride), slice(y0, y1, stride), slice(x0, x1, stride), index_bounds, world_bounds, stride
+
+    def _axis_world_coord(self, axis_name, index):
+        if axis_name == "x":
+            return float((index - self.NX / 2) * self.LX)
+        if axis_name == "y":
+            return float((index - self.NY / 2) * self.LY)
+        if axis_name == "z":
+            return float(((self.global_nz_start + index) - self.global_nz_total / 2) * self.LZ)
+        raise ValueError(f"Unknown axis_name: {axis_name}")
+
+    def _resolve_slice_index(self, axis_name, requested_index, start, stop):
+        if requested_index is None:
+            return max(start, min(stop - 1, (start + stop - 1) // 2))
+
+        idx = int(requested_index)
+        if axis_name == "z":
+            idx -= self.global_nz_start
+
+        return max(start, min(stop - 1, idx))
+
+    def extract_field_block(self, field_name="density", region=None, stride=1, max_cells=None,
+                            transfer_mode="cube", slice_axis="z", slice_index=None):
+        field_map = {
+            "density": self.densityfield,
+            "density2": self.densityfield2,
+            "flow": self.flowfield,
+            "curl": self.curlfield,
+        }
+        if field_name not in field_map:
+            raise ValueError(f"Unknown field_name: {field_name}")
+
+        z_slice, y_slice, x_slice, index_bounds, world_bounds, stride = self._get_region_slices(
+            region=region,
+            stride=stride,
+            max_cells=max_cells,
+        )
+
+        data = field_map[field_name][z_slice, y_slice, x_slice]
+        transfer_mode = str(transfer_mode).lower()
+        slice_axis = str(slice_axis).lower()
+
+        if transfer_mode == "slice":
+            z0, z1 = index_bounds["z"]
+            y0, y1 = index_bounds["y"]
+            x0, x1 = index_bounds["x"]
+
+            if slice_axis == "z":
+                idx = self._resolve_slice_index("z", slice_index, z0, z1)
+                data = field_map[field_name][idx:idx+1, y_slice, x_slice]
+                index_bounds["z"] = (int(idx), int(idx + 1))
+                z_world = self._axis_world_coord("z", idx)
+                world_bounds["z"] = (z_world, z_world)
+            elif slice_axis == "y":
+                idx = self._resolve_slice_index("y", slice_index, y0, y1)
+                data = field_map[field_name][z_slice, idx:idx+1, x_slice]
+                index_bounds["y"] = (int(idx), int(idx + 1))
+                y_world = self._axis_world_coord("y", idx)
+                world_bounds["y"] = (y_world, y_world)
+            elif slice_axis == "x":
+                idx = self._resolve_slice_index("x", slice_index, x0, x1)
+                data = field_map[field_name][z_slice, y_slice, idx:idx+1]
+                index_bounds["x"] = (int(idx), int(idx + 1))
+                x_world = self._axis_world_coord("x", idx)
+                world_bounds["x"] = (x_world, x_world)
+            else:
+                raise ValueError(f"Unknown slice_axis: {slice_axis}")
+
+        spatial_shape = data.shape[:3] if data.ndim >= 3 else data.shape
+
+        return {
+            "data": data,
+            "spatial_shape": tuple(int(v) for v in spatial_shape),
+            "index_bounds": index_bounds,
+            "world_bounds": world_bounds,
+            "stride": int(stride),
+            "transfer_mode": transfer_mode,
+            "slice_axis": slice_axis,
+            "slice_index": slice_index,
+        }
 
     # -------------------------
     # Diagnostics / helpers
@@ -969,146 +859,8 @@ class WorldStep:
             print("Error computing field stats:", e)
 
     def export_particle_force_diagnostics(self, csv_path='particle_diagnostics.csv', dt=0.1, num_samples=500):
-        """Export detailed force diagnostics for particles to CSV file.
-        
-        Args:
-            csv_path: Output CSV file path
-            dt: Timestep (same as used in step_particles)
-            num_samples: Number of particles to sample (or 'all' for all particles)
-        """
-        import csv
-        
-        if self.num_particles == 0:
-            print("No particles to diagnose")
-            return
-        
-        # Select sample indices
-        if num_samples == 'all' or num_samples >= self.num_particles:
-            sample_indices = cp.arange(self.num_particles)
-        else:
-            # Sample uniformly across all particles
-            step = max(1, self.num_particles // num_samples)
-            sample_indices = cp.arange(0, self.num_particles, step)
-        
-        # Get sample particles
-        sample_particles = self.particles[sample_indices]
-        sample_particles2 = self.particles2[sample_indices]
-        sample_vel = self.particles_vel[sample_indices]
-        sample_vel2 = self.particles2_vel[sample_indices]
-        
-        # Compute forces (same as step_particles)
-        flow_contrib = self.compute_gradient_contributions(sample_particles, self.flowfield)
-        flow_contrib2 = -self.compute_gradient_contributions(sample_particles2, self.flowfield)
-        
-        curl_contrib = self.compute_curl_contributions(sample_particles, self.curlfield)
-        curl_contrib2 = -self.compute_curl_contributions(sample_particles2, self.curlfield)
-        
-        # Sample field values at particle positions
-        density_at_p1 = self._sample_scalar_field_at_points(sample_particles, self.densityfield)
-        density_at_p2 = self._sample_scalar_field_at_points(sample_particles2, self.densityfield)
-        
-        # Convert to numpy for CSV writing
-        sample_particles_np = cp.asnumpy(sample_particles)
-        sample_particles2_np = cp.asnumpy(sample_particles2)
-        sample_vel_np = cp.asnumpy(sample_vel)
-        sample_vel2_np = cp.asnumpy(sample_vel2)
-        flow_contrib_np = cp.asnumpy(flow_contrib)
-        flow_contrib2_np = cp.asnumpy(flow_contrib2)
-        curl_contrib_np = cp.asnumpy(curl_contrib)
-        curl_contrib2_np = cp.asnumpy(curl_contrib2)
-        density_at_p1_np = cp.asnumpy(density_at_p1)
-        density_at_p2_np = cp.asnumpy(density_at_p2)
-        
-        # Calculate domain bounds for corner detection
-        half_lx = self.LX * self.NX / 2
-        half_ly = self.LY * self.NY / 2
-        half_lz = self.LZ * self.NZ / 2
-        corner_threshold = min(self.LX, self.LY, self.LZ) * 3  # Within 3 cells of corner
-        
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Header
-            writer.writerow([
-                'particle_set', 'particle_id', 'global_id',
-                'pos_x', 'pos_y', 'pos_z',
-                'vel_x', 'vel_y', 'vel_z', 'vel_mag',
-                'flow_force_x', 'flow_force_y', 'flow_force_z', 'flow_force_mag',
-                'curl_contrib_x', 'curl_contrib_y', 'curl_contrib_z', 'curl_contrib_mag',
-                'density_at_particle',
-                'dist_to_center', 'near_corner',
-                'normalized_pos_x', 'normalized_pos_y', 'normalized_pos_z'
-            ])
-            
-            # Write particle set 1
-            for i, idx in enumerate(sample_indices.get()):
-                pos = sample_particles_np[i]
-                vel = sample_vel_np[i]
-                flow_f = flow_contrib_np[i]
-                curl_f = curl_contrib_np[i]
-                density = density_at_p1_np[i]
-                
-                vel_mag = cp.linalg.norm(vel)
-                flow_mag = cp.linalg.norm(flow_f)
-                curl_mag = cp.linalg.norm(curl_f)
-                dist_center = cp.linalg.norm(pos)
-                
-                # Check if near corner (all 3 coords near max/min)
-                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
-                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
-                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
-                near_corner = near_x and near_y and near_z
-                
-                # Normalized position [-1, 1] in each dimension
-                norm_x = pos[0] / half_lx
-                norm_y = pos[1] / half_ly
-                norm_z = pos[2] / half_lz
-                
-                writer.writerow([
-                    'set1', i, int(idx),
-                    pos[0], pos[1], pos[2],
-                    vel[0], vel[1], vel[2], vel_mag,
-                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
-                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
-                    density,
-                    dist_center, near_corner,
-                    norm_x, norm_y, norm_z
-                ])
-            
-            # Write particle set 2
-            for i, idx in enumerate(sample_indices.get()):
-                pos = sample_particles2_np[i]
-                vel = sample_vel2_np[i]
-                flow_f = flow_contrib2_np[i]
-                curl_f = curl_contrib2_np[i]
-                density = density_at_p2_np[i]
-                
-                vel_mag = cp.linalg.norm(vel)
-                flow_mag = cp.linalg.norm(flow_f)
-                curl_mag = cp.linalg.norm(curl_f)
-                dist_center = cp.linalg.norm(pos)
-                
-                near_x = abs(abs(pos[0]) - half_lx) < corner_threshold
-                near_y = abs(abs(pos[1]) - half_ly) < corner_threshold
-                near_z = abs(abs(pos[2]) - half_lz) < corner_threshold
-                near_corner = near_x and near_y and near_z
-                
-                norm_x = pos[0] / half_lx
-                norm_y = pos[1] / half_ly
-                norm_z = pos[2] / half_lz
-                
-                writer.writerow([
-                    'set2', i, int(idx),
-                    pos[0], pos[1], pos[2],
-                    vel[0], vel[1], vel[2], vel_mag,
-                    flow_f[0], flow_f[1], flow_f[2], flow_mag,
-                    curl_f[0], curl_f[1], curl_f[2], curl_mag,
-                    density,
-                    dist_center, near_corner,
-                    norm_x, norm_y, norm_z
-                ])
-        
-        print(f"Exported {len(sample_indices) * 2} particle diagnostics to {csv_path}")
+        """Particle diagnostics are disabled in the server build."""
+        print("Particle force diagnostics have been removed from Main11Server.")
     
     def _sample_scalar_field_at_points(self, points, field):
         """Sample scalar field values at particle positions using trilinear interpolation."""

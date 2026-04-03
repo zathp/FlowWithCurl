@@ -46,10 +46,39 @@ def recv_payload(sock):
     return pickle.loads(zlib.decompress(body))
 
 
+def field_to_image(field_name, data, transfer_mode="cube"):
+    arr = np.asarray(data)
+    if arr.size == 0:
+        return None
+
+    if field_name in ("flow", "curl") and arr.ndim == 4:
+        arr = np.linalg.norm(arr, axis=-1)
+
+    arr = np.squeeze(arr)
+    if transfer_mode == "slice":
+        if arr.ndim == 1:
+            return arr.reshape(1, -1)
+        if arr.ndim == 2:
+            return arr
+        return np.atleast_2d(arr)
+
+    if arr.ndim == 3:
+        return arr[arr.shape[0] // 2]
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    return np.atleast_2d(arr)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Monitor client for Main11Server headless particle streaming")
+    parser = argparse.ArgumentParser(description="Monitor client for Main11Server headless field streaming")
     parser.add_argument("--host", required=True, help="Server IP or hostname")
     parser.add_argument("--port", type=int, default=5055)
+    parser.add_argument("--field", choices=["density", "density2", "flow", "curl"], default="density")
+    parser.add_argument("--transfer-mode", choices=["cube", "slice"], default="cube")
+    parser.add_argument("--slice-axis", choices=["x", "y", "z"], default="z")
+    parser.add_argument("--slice-index", type=int, default=None)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--send-every", type=int, default=20)
     parser.add_argument("--max-points", type=int, default=20000)
@@ -58,6 +87,10 @@ def main():
     args = parser.parse_args()
 
     subscription = {
+        "field": args.field,
+        "transfer_mode": args.transfer_mode,
+        "slice_axis": args.slice_axis,
+        "slice_index": args.slice_index,
         "region": parse_region_values(args.region),
         "stride": max(1, args.stride),
         "send_every": max(1, args.send_every),
@@ -69,6 +102,8 @@ def main():
     sock.settimeout(None)
 
     print(f"Connected to {args.host}:{args.port}")
+    print(f"Requested field: {subscription['field']}")
+    print(f"Requested transfer mode: {subscription['transfer_mode']}")
     print(f"Requested region: {subscription['region']}")
 
     if args.no_plot:
@@ -79,21 +114,23 @@ def main():
                 break
             print(
                 f"frame={payload['frame_id']:6d} step={payload['step_count']:6d} "
-                f"verts={payload['num_vertices']:6d} density_mean={payload['stats']['density']['mean']:.4f}"
+                f"mode={payload.get('transfer_mode', 'cube'):5s} field={payload['field_name']:8s} "
+                f"cells={payload['num_cells']:6d} shape={payload['shape']}"
             )
         return
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(10, 8))
-    scatter = ax.scatter([], [], s=[], c=[])
+    image = ax.imshow(np.zeros((2, 2), dtype=np.float32), cmap="viridis", origin="lower")
+    cbar = plt.colorbar(image, ax=ax)
     ax.set_facecolor("#111111")
     fig.patch.set_facecolor("#111111")
     ax.tick_params(colors="white")
     ax.xaxis.label.set_color("white")
     ax.yaxis.label.set_color("white")
     ax.title.set_color("white")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
+    ax.set_xlabel("X index")
+    ax.set_ylabel("Y index")
 
     while True:
         payload = recv_payload(sock)
@@ -101,21 +138,19 @@ def main():
             print("Server disconnected")
             break
 
-        verts = payload["verts"]
-        if verts.shape[0] == 0:
-            ax.set_title(f"Frame {payload['frame_id']} - no vertices in requested region")
+        frame = field_to_image(payload["field_name"], payload["field_data"], payload.get("transfer_mode", "cube"))
+        if frame is None or frame.size == 0:
+            ax.set_title(f"Frame {payload['frame_id']} - no cells in requested region")
             plt.pause(0.001)
             continue
 
-        pos = verts[:, :2]
-        colors = verts[:, 3:6]
-        sizes = np.clip(verts[:, 6], 1.0, 50.0)
-
-        scatter.remove()
-        scatter = ax.scatter(pos[:, 0], pos[:, 1], c=colors, s=sizes, edgecolors="none")
-        ax.set_title(f"Frame {payload['frame_id']}  |  step {payload['step_count']}  |  verts {payload['num_vertices']}")
-        ax.relim()
-        ax.autoscale_view()
+        image.set_data(frame)
+        image.set_clim(vmin=float(np.min(frame)), vmax=float(np.max(frame) + 1e-9))
+        ax.set_title(
+            f"Frame {payload['frame_id']} | step {payload['step_count']} | "
+            f"{payload.get('transfer_mode', 'cube')} {payload['field_name']} | cells {payload['num_cells']}"
+        )
+        ax.set_aspect("auto")
         plt.pause(0.001)
 
     sock.close()
